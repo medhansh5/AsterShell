@@ -163,20 +163,39 @@ pub mod transport {
         ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
     };
 
-    /// Creates a Named Pipe server instance with standard buffer parameters.
+    /// Creates a Named Pipe server instance with standard buffer parameters and optional security attributes.
     pub fn create_pipe_server(pipe_name: &str, is_first: bool) -> Result<NamedPipeServer> {
+        create_pipe_server_with_security(pipe_name, is_first, None)
+    }
+
+    /// Creates a Named Pipe server instance with explicit security attributes.
+    pub fn create_pipe_server_with_security(
+        pipe_name: &str,
+        is_first: bool,
+        mut sa_ptr: Option<*mut std::ffi::c_void>,
+    ) -> Result<NamedPipeServer> {
         let mut options = ServerOptions::new();
         options.first_pipe_instance(is_first);
         options.max_instances(16);
         options.in_buffer_size(65536);
         options.out_buffer_size(65536);
 
-        options.create(pipe_name).map_err(|e| {
-            AsterError::Ipc(format!(
-                "Failed to create pipe server '{}': {}",
-                pipe_name, e
-            ))
-        })
+        if let Some(ptr) = sa_ptr.take() {
+            // SAFETY: Caller guarantees pointer is a valid SECURITY_ATTRIBUTES or null.
+            unsafe { options.create_with_security_attributes_raw(pipe_name, ptr) }.map_err(|e| {
+                AsterError::Ipc(format!(
+                    "Failed to create secure pipe server '{}': {}",
+                    pipe_name, e
+                ))
+            })
+        } else {
+            options.create(pipe_name).map_err(|e| {
+                AsterError::Ipc(format!(
+                    "Failed to create pipe server '{}': {}",
+                    pipe_name, e
+                ))
+            })
+        }
     }
 
     /// Connects a client to the Named Pipe server.
@@ -347,6 +366,58 @@ mod tests {
                 timestamp_ms: 12345
             }
         );
+
+        server_task.await.unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_named_pipe_with_explicit_security_attributes() {
+        let pipe_name = r"\\.\pipe\astershell-test-pipe-secure";
+        let sddl = platform_windows::default_pipe_sddl().expect("Valid SDDL");
+        let mut desc =
+            platform_windows::PipeSecurityDescriptor::from_sddl(&sddl).expect("Valid descriptor");
+
+        let server = transport::create_pipe_server_with_security(
+            pipe_name,
+            true,
+            Some(desc.as_raw_mut_ptr()),
+        )
+        .expect("Failed to create secured pipe server");
+
+        let server_task = tokio::spawn(async move {
+            server.connect().await.expect("Accept failed");
+            let mut server = server;
+            let req: RequestEnvelope = transport::read_framed_message(&mut server)
+                .await
+                .expect("Read failed");
+            let resp = ResponseEnvelope {
+                request_id: req.request_id,
+                response: IpcResponse::Ack,
+            };
+            transport::write_framed_message(&mut server, &resp)
+                .await
+                .expect("Write failed");
+        });
+
+        let mut client = transport::connect_pipe_client(pipe_name)
+            .await
+            .expect("Authorized client connection failed");
+
+        let req = RequestEnvelope {
+            request_id: 202,
+            request: IpcRequest::Ping { timestamp_ms: 999 },
+        };
+        transport::write_framed_message(&mut client, &req)
+            .await
+            .expect("Client send failed");
+
+        let resp: ResponseEnvelope = transport::read_framed_message(&mut client)
+            .await
+            .expect("Client read failed");
+
+        assert_eq!(resp.request_id, 202);
+        assert_eq!(resp.response, IpcResponse::Ack);
 
         server_task.await.unwrap();
     }

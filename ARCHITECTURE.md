@@ -89,10 +89,10 @@ AsterShell is engineered from the ground up as a native, resilient, modular Wind
 ## 5. IPC Architecture & Message Flow
 
 - **Transport:** Windows Named Pipes located at `\\.\pipe\astershell-ipc-{hash(username)}`.
-- **Security:** Strict security descriptor granting read/write access solely to the current user token (`SDDL: D:(A;;GRGW;;;{UserSID})`). No cross-session access.
+- **Security:** Strict security descriptor granting read/write access solely to the current user token and full control to Administrators (`SDDL: D:(A;;GRGW;;;{UserSID})(A;;GA;;;BA)`). No cross-session access. Client process identity is verified using `GetNamedPipeClientProcessId`.
 - **Framing:** 8-byte header:
   - `Magic`: `[u8; 4]` (`"ASTS"`)
   - `Version`: `u16` (`1`)
   - `MessageLength`: `u16` (up to 65,535 bytes per frame)
-  - `Payload`: Binary message encoded via `rkyv` (zero-copy) or `postcard` (fast compact serde).
-- **Handshake & Negotiation:** Upon connection, the client and server exchange `HandshakeRequest` and `HandshakeResponse` negotiating maximum protocol version and supported feature flags.
+  - `Payload`: Binary message encoded via `postcard`.
+- **Handshake & Negotiation:** Upon connection, the client and server exchange `HandshakeRequest` and `HandshakeResponse` negotiating maximum protocol version and supported feature flags. Client process ID is recorded and logged.

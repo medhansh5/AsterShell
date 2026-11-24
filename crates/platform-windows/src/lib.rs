@@ -210,6 +210,130 @@ pub fn default_pipe_address() -> String {
     format!(r"\\.\pipe\astershell-ipc-{}", hash)
 }
 
+/// Generates the standard user-restricted Named Pipe SDDL string.
+pub fn default_pipe_sddl() -> Result<String> {
+    let sid = get_current_user_sid()?;
+    Ok(format!("D:(A;;GRGW;;;{})(A;;GA;;;BA)", sid))
+}
+
+/// RAII wrapper for Windows SECURITY_ATTRIBUTES created from SDDL for Named Pipes.
+pub struct PipeSecurityDescriptor {
+    #[cfg(windows)]
+    sd: windows::Win32::Security::PSECURITY_DESCRIPTOR,
+    #[cfg(windows)]
+    sa: windows::Win32::Security::SECURITY_ATTRIBUTES,
+    sddl: String,
+}
+
+impl PipeSecurityDescriptor {
+    /// Creates a new security descriptor from an SDDL string.
+    pub fn from_sddl(sddl: &str) -> Result<Self> {
+        #[cfg(windows)]
+        {
+            use windows::core::HSTRING;
+            use windows::Win32::Security::Authorization::{
+                ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+            };
+            use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+
+            let h_sddl = HSTRING::from(sddl);
+            let mut sd = PSECURITY_DESCRIPTOR::default();
+            // SAFETY: ConvertStringSecurityDescriptorToSecurityDescriptorW parses the SDDL and allocates *sd.
+            unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    &h_sddl,
+                    SDDL_REVISION_1,
+                    &mut sd,
+                    None,
+                )
+                .map_err(|e| {
+                    AsterError::Platform(format!("Failed to parse SDDL '{}': {}", sddl, e))
+                })?;
+            }
+
+            let sa = SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: sd.0,
+                bInheritHandle: windows::Win32::Foundation::BOOL(0),
+            };
+
+            Ok(Self {
+                sd,
+                sa,
+                sddl: sddl.to_string(),
+            })
+        }
+
+        #[cfg(not(windows))]
+        {
+            Ok(Self {
+                sddl: sddl.to_string(),
+            })
+        }
+    }
+
+    /// Returns a raw pointer to the `SECURITY_ATTRIBUTES` structure.
+    pub fn as_raw_mut_ptr(&mut self) -> *mut std::ffi::c_void {
+        #[cfg(windows)]
+        {
+            &mut self.sa as *mut _ as *mut std::ffi::c_void
+        }
+        #[cfg(not(windows))]
+        {
+            std::ptr::null_mut()
+        }
+    }
+
+    pub fn sddl(&self) -> &str {
+        &self.sddl
+    }
+}
+
+impl Drop for PipeSecurityDescriptor {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        {
+            if !self.sd.0.is_null() {
+                // SAFETY: Freeing memory allocated by ConvertStringSecurityDescriptorToSecurityDescriptorW.
+                unsafe {
+                    let _ = LocalFree(HLOCAL(self.sd.0));
+                }
+            }
+        }
+    }
+}
+
+// SAFETY: Security descriptor is self-contained.
+unsafe impl Send for PipeSecurityDescriptor {}
+unsafe impl Sync for PipeSecurityDescriptor {}
+
+/// Queries the client process ID connected to a named pipe handle.
+#[cfg(windows)]
+pub fn get_named_pipe_client_pid(pipe_handle: HANDLE) -> Result<u32> {
+    use windows::Win32::System::Pipes::GetNamedPipeClientProcessId;
+
+    let mut client_pid = 0u32;
+    // SAFETY: GetNamedPipeClientProcessId takes a valid pipe handle and writes client PID to pointer.
+    unsafe {
+        GetNamedPipeClientProcessId(pipe_handle, &mut client_pid).map_err(|e| {
+            AsterError::Platform(format!("Failed to query named pipe client PID: {}", e))
+        })?;
+    }
+    Ok(client_pid)
+}
+
+/// Safe wrapper to query client process ID from any type implementing `AsRawHandle`.
+#[cfg(windows)]
+pub fn get_pipe_client_pid<H: std::os::windows::io::AsRawHandle>(pipe: &H) -> Result<u32> {
+    let raw = pipe.as_raw_handle();
+    get_named_pipe_client_pid(HANDLE(raw as _))
+}
+
+#[cfg(not(windows))]
+pub fn get_pipe_client_pid<H>(_pipe: &H) -> Result<u32> {
+    Ok(0)
+}
+
 pub fn crate_name() -> &'static str {
     "platform-windows"
 }
@@ -217,6 +341,48 @@ pub fn crate_name() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_search_manager_com_initialization() {
+        use windows::core::HSTRING;
+        use windows::Win32::System::Com::{
+            CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED,
+        };
+        use windows::Win32::System::Search::{CSearchManager, ISearchManager};
+
+        // SAFETY: Initializing COM in MTA mode on this thread for platform test.
+        unsafe {
+            let hr = CoInitializeEx(None, COINIT_MULTITHREADED);
+            assert!(hr.is_ok(), "CoInitializeEx should succeed");
+
+            let search_mgr: std::result::Result<ISearchManager, windows::core::Error> =
+                CoCreateInstance(&CSearchManager, None, CLSCTX_ALL);
+
+            if let Ok(mgr) = search_mgr {
+                let cat_name = HSTRING::from("SystemIndex");
+                let catalog_res = mgr.GetCatalog(&cat_name);
+                assert!(
+                    catalog_res.is_ok(),
+                    "GetCatalog(SystemIndex) should succeed"
+                );
+
+                let catalog = catalog_res.unwrap();
+                let helper_res = catalog.GetQueryHelper();
+                assert!(helper_res.is_ok(), "GetQueryHelper should succeed");
+
+                let helper = helper_res.unwrap();
+                let conn_str = helper.ConnectionString().expect("ConnectionString");
+                let _ = LocalFree(HLOCAL(conn_str.as_ptr() as _));
+
+                let query_hstr = HSTRING::from("test");
+                if let Ok(sql_pwstr) = helper.GenerateSQLFromUserQuery(&query_hstr) {
+                    let _ = LocalFree(HLOCAL(sql_pwstr.as_ptr() as _));
+                }
+            }
+
+            CoUninitialize();
+        }
+    }
 
     #[test]
     fn test_job_object_lifecycle() {
@@ -236,5 +402,17 @@ mod tests {
     fn test_pipe_address_format() {
         let pipe_addr = default_pipe_address();
         assert!(pipe_addr.starts_with(r"\\.\pipe\astershell-ipc-"));
+    }
+
+    #[test]
+    fn test_default_pipe_sddl_and_security_descriptor() {
+        let sddl = default_pipe_sddl().expect("Should compute default pipe SDDL");
+        assert!(sddl.starts_with("D:(A;;GRGW;;;"));
+        assert!(sddl.ends_with("(A;;GA;;;BA)"));
+
+        let mut desc = PipeSecurityDescriptor::from_sddl(&sddl)
+            .expect("Should construct PipeSecurityDescriptor from valid SDDL");
+        assert!(!desc.as_raw_mut_ptr().is_null());
+        assert_eq!(desc.sddl(), sddl);
     }
 }

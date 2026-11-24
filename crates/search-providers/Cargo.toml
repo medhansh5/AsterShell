@@ -8,4 +8,22 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+astercore = { workspace = true }
+search-core = { workspace = true }
+application-catalog = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
 thiserror = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Search",
+] }
+
+[dev-dependencies]
+search-index = { workspace = true }

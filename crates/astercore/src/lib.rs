@@ -106,6 +106,9 @@ pub enum AsterError {
     #[error("Application discovery error: {0}")]
     Discovery(String),
 
+    #[error("Search error: {0}")]
+    Search(String),
+
     #[error("Serialization error: {0}")]
     Serialization(String),
 

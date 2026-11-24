@@ -8,4 +8,9 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+astercore = { workspace = true }
+search-core = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }

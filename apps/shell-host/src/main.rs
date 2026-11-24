@@ -71,7 +71,14 @@ impl ShellHostDaemon {
             while is_running.load(Ordering::SeqCst) {
                 #[cfg(windows)]
                 {
-                    match transport::create_pipe_server(&pipe_addr, is_first) {
+                    let mut pipe_sec =
+                        platform_windows::default_pipe_sddl().ok().and_then(|sddl| {
+                            platform_windows::PipeSecurityDescriptor::from_sddl(&sddl).ok()
+                        });
+                    let sa_ptr = pipe_sec.as_mut().map(|s| s.as_raw_mut_ptr());
+
+                    match transport::create_pipe_server_with_security(&pipe_addr, is_first, sa_ptr)
+                    {
                         Ok(server) => {
                             is_first = false;
                             let s_tx = shutdown_tx.clone();
@@ -158,7 +165,13 @@ async fn handle_client_connection(
                 client_version,
                 ref client_name,
             } => {
-                tracing::info!(client = %client_name, client_version, "IPC Client connected");
+                let client_pid = platform_windows::get_pipe_client_pid(&stream).unwrap_or(0);
+                tracing::info!(
+                    client = %client_name,
+                    client_version,
+                    client_pid,
+                    "IPC Client authenticated and connected"
+                );
                 IpcResponse::HandshakeAck {
                     negotiated_version: PROTOCOL_VERSION_1,
                     server_pid: std::process::id(),
