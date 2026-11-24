@@ -1,9 +1,247 @@
-﻿//! AsterShell crate: process-supervisor
+﻿//! AsterShell Process Supervisor Subsystem
 
-#[derive(thiserror::Error, Debug)]
-pub enum Error {
-    #[error("Internal error in process-supervisor")]
-    Internal,
+use astercore::{AsterError, ComponentId, ProcessStatus, RestartPolicy, Result};
+use platform_windows::JobObject;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+/// Specification for launching a managed child process.
+#[derive(Debug, Clone)]
+pub struct ProcessSpec {
+    pub id: ComponentId,
+    pub executable: PathBuf,
+    pub args: Vec<String>,
+    pub restart_policy: RestartPolicy,
+}
+
+/// Action determined by the supervisor during a health evaluation cycle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SupervisorAction {
+    Running,
+    RestartingImmediately(ComponentId),
+    BackoffDelay { id: ComponentId, delay_ms: u64 },
+    CircuitBroken(ComponentId),
+}
+
+/// Internal state tracking for a single supervised child process.
+pub struct ManagedChild {
+    pub spec: ProcessSpec,
+    pub status: ProcessStatus,
+    pub child: Option<tokio::process::Child>,
+    pub crash_timestamps: Vec<Instant>,
+    pub consecutive_crashes: u32,
+    pub next_restart_allowed: Option<Instant>,
+}
+
+impl ManagedChild {
+    pub fn new(spec: ProcessSpec) -> Self {
+        Self {
+            spec,
+            status: ProcessStatus::Uninitialized,
+            child: None,
+            crash_timestamps: Vec::new(),
+            consecutive_crashes: 0,
+            next_restart_allowed: None,
+        }
+    }
+
+    /// Evaluates crash history against the restart policy to determine next state.
+    pub fn evaluate_crash(&mut self, exit_code: Option<u32>) -> SupervisorAction {
+        let now = Instant::now();
+        self.consecutive_crashes += 1;
+        self.crash_timestamps.push(now);
+
+        // Filter out crashes outside window
+        let window_duration = Duration::from_secs(self.spec.restart_policy.window_secs);
+        self.crash_timestamps
+            .retain(|&t| now.duration_since(t) <= window_duration);
+
+        if self.consecutive_crashes >= self.spec.restart_policy.circuit_breaker_threshold {
+            self.status = ProcessStatus::CircuitBroken {
+                consecutive_crashes: self.consecutive_crashes,
+            };
+            tracing::error!(
+                process = self.spec.id.as_str(),
+                crashes = self.consecutive_crashes,
+                "Circuit breaker tripped! Process suspended from automatic restarts."
+            );
+            return SupervisorAction::CircuitBroken(self.spec.id);
+        }
+
+        if self.crash_timestamps.len() as u32 > self.spec.restart_policy.max_retries_in_window {
+            let backoff_multiplier = 2u64.pow((self.consecutive_crashes - 1).min(6));
+            let delay_ms = (self.spec.restart_policy.initial_backoff_ms * backoff_multiplier)
+                .min(self.spec.restart_policy.max_off_ms_capped());
+
+            self.next_restart_allowed = Some(now + Duration::from_millis(delay_ms));
+            self.status = ProcessStatus::BackoffPaused {
+                retry_in_ms: delay_ms,
+            };
+
+            tracing::warn!(
+                process = self.spec.id.as_str(),
+                delay_ms,
+                "Rate limit exceeded. Process placed in backoff."
+            );
+            SupervisorAction::BackoffDelay {
+                id: self.spec.id,
+                delay_ms,
+            }
+        } else {
+            self.status = ProcessStatus::Crashed { exit_code };
+            tracing::info!(
+                process = self.spec.id.as_str(),
+                exit_code = ?exit_code,
+                "Process crashed; restarting immediately."
+            );
+            SupervisorAction::RestartingImmediately(self.spec.id)
+        }
+    }
+}
+
+trait RestartPolicyExt {
+    fn max_off_ms_capped(&self) -> u64;
+}
+
+impl RestartPolicyExt for RestartPolicy {
+    fn max_off_ms_capped(&self) -> u64 {
+        self.max_backoff_ms
+    }
+}
+
+/// Persistent supervisor managing child processes assigned to a Windows Job Object.
+pub struct ProcessSupervisor {
+    job_object: JobObject,
+    processes: HashMap<ComponentId, ManagedChild>,
+}
+
+impl ProcessSupervisor {
+    pub fn new(job_object: JobObject) -> Self {
+        Self {
+            job_object,
+            processes: HashMap::new(),
+        }
+    }
+
+    pub fn register(&mut self, spec: ProcessSpec) {
+        let id = spec.id;
+        self.processes.insert(id, ManagedChild::new(spec));
+    }
+
+    /// Spawns a registered child process and binds its handle to the Job Object.
+    pub fn spawn(&mut self, id: ComponentId) -> Result<u32> {
+        let managed = self
+            .processes
+            .get_mut(&id)
+            .ok_or_else(|| AsterError::Supervisor(format!("Unregistered component: {:?}", id)))?;
+
+        managed.status = ProcessStatus::Starting;
+
+        let mut cmd = tokio::process::Command::new(&managed.spec.executable);
+        cmd.args(&managed.spec.args);
+
+        #[cfg(windows)]
+        {
+            // CREATE_SUSPENDED would allow atomic Job assignment; standard spawn + immediate assign is supported
+        }
+
+        let child = cmd
+            .spawn()
+            .map_err(|e| AsterError::Supervisor(format!("Failed to spawn {:?}: {}", id, e)))?;
+
+        let pid = child.id().unwrap_or(0);
+
+        #[cfg(windows)]
+        if let Some(raw_h) = child.raw_handle() {
+            let _ = self.job_object.assign_raw_handle(raw_h as _);
+        }
+
+        managed.child = Some(child);
+        managed.status = ProcessStatus::Running;
+        tracing::info!(process = id.as_str(), pid, "Spawned supervised process");
+        Ok(pid)
+    }
+
+    /// Checks the health of all managed child processes, returning actions taken.
+    pub async fn poll_health(&mut self) -> Vec<SupervisorAction> {
+        let mut actions = Vec::new();
+        let now = Instant::now();
+
+        for (&id, managed) in self.processes.iter_mut() {
+            // Check if backoff delay has elapsed
+            if let ProcessStatus::BackoffPaused { .. } = managed.status {
+                if let Some(allowed_time) = managed.next_restart_allowed {
+                    if now >= allowed_time {
+                        managed.next_restart_allowed = None;
+                        actions.push(SupervisorAction::RestartingImmediately(id));
+                    }
+                }
+                continue;
+            }
+
+            // Check live child status
+            if let Some(ref mut child) = managed.child {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        let code = status.code().map(|c| c as u32);
+                        let action = managed.evaluate_crash(code);
+                        managed.child = None;
+                        actions.push(action);
+                    }
+                    Ok(None) => {
+                        // Still running
+                    }
+                    Err(e) => {
+                        tracing::error!(process = id.as_str(), error = %e, "try_wait failed");
+                    }
+                }
+            }
+        }
+
+        actions
+    }
+
+    /// Gracefully terminates all supervised child processes within a given timeout.
+    pub async fn shutdown_all(&mut self, timeout: Duration) -> Result<()> {
+        tracing::info!("Initiating supervisor graceful shutdown...");
+        let start = Instant::now();
+
+        for (&id, managed) in self.processes.iter_mut() {
+            if let Some(mut child) = managed.child.take() {
+                tracing::debug!(process = id.as_str(), "Terminating child process");
+                let _ = child.start_kill();
+            }
+            managed.status = ProcessStatus::Stopped;
+        }
+
+        while start.elapsed() < timeout {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let mut any_alive = false;
+            for managed in self.processes.values_mut() {
+                if let Some(ref mut child) = managed.child {
+                    if let Ok(None) = child.try_wait() {
+                        any_alive = true;
+                        break;
+                    }
+                }
+            }
+            if !any_alive {
+                break;
+            }
+        }
+
+        tracing::info!("Supervisor shutdown completed.");
+        Ok(())
+    }
+
+    pub fn status(&self, id: ComponentId) -> Option<ProcessStatus> {
+        self.processes.get(&id).map(|p| p.status)
+    }
+
+    pub fn job_object(&self) -> &JobObject {
+        &self.job_object
+    }
 }
 
 pub fn crate_name() -> &'static str {
@@ -15,7 +253,77 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_crate_name() {
-        assert_eq!(crate_name(), "process-supervisor");
+    fn test_crash_evaluation_immediate_restart() {
+        let spec = ProcessSpec {
+            id: ComponentId::Taskbar,
+            executable: PathBuf::from("dummy.exe"),
+            args: vec![],
+            restart_policy: RestartPolicy::default(),
+        };
+
+        let mut child = ManagedChild::new(spec);
+        let action = child.evaluate_crash(Some(1));
+        assert_eq!(
+            action,
+            SupervisorAction::RestartingImmediately(ComponentId::Taskbar)
+        );
+        assert_eq!(child.consecutive_crashes, 1);
+    }
+
+    #[test]
+    fn test_circuit_breaker_tripping() {
+        let spec = ProcessSpec {
+            id: ComponentId::SearchUi,
+            executable: PathBuf::from("dummy.exe"),
+            args: vec![],
+            restart_policy: RestartPolicy {
+                circuit_breaker_threshold: 3,
+                ..Default::default()
+            },
+        };
+
+        let mut child = ManagedChild::new(spec);
+        let _ = child.evaluate_crash(Some(1)); // Crash 1
+        let _ = child.evaluate_crash(Some(1)); // Crash 2
+        let action = child.evaluate_crash(Some(1)); // Crash 3 -> Trips breaker
+
+        assert_eq!(
+            action,
+            SupervisorAction::CircuitBroken(ComponentId::SearchUi)
+        );
+        assert_eq!(
+            child.status,
+            ProcessStatus::CircuitBroken {
+                consecutive_crashes: 3
+            }
+        );
+    }
+
+    #[test]
+    fn test_backoff_delay_calculation() {
+        let spec = ProcessSpec {
+            id: ComponentId::Desktop,
+            executable: PathBuf::from("dummy.exe"),
+            args: vec![],
+            restart_policy: RestartPolicy {
+                max_retries_in_window: 1,
+                window_secs: 60,
+                initial_backoff_ms: 500,
+                max_backoff_ms: 10000,
+                circuit_breaker_threshold: 10,
+            },
+        };
+
+        let mut child = ManagedChild::new(spec);
+        let _ = child.evaluate_crash(Some(1)); // Crash 1: within retry limit
+        let action = child.evaluate_crash(Some(1)); // Crash 2: exceeds limit of 1 in window
+
+        match action {
+            SupervisorAction::BackoffDelay { id, delay_ms } => {
+                assert_eq!(id, ComponentId::Desktop);
+                assert!(delay_ms >= 500);
+            }
+            other => panic!("Expected BackoffDelay, got {:?}", other),
+        }
     }
 }

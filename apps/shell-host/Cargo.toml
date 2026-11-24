@@ -10,5 +10,12 @@ workspace = true
 [dependencies]
 astercore = { workspace = true }
 diagnostics = { workspace = true }
-tracing = { workspace = true }
+configuration = { workspace = true }
+platform-windows = { workspace = true }
+ipc = { workspace = true }
+process-supervisor = { workspace = true }
+application-catalog = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }

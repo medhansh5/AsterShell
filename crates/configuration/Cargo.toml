@@ -8,4 +8,8 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+astercore = { workspace = true }
 thiserror = { workspace = true }
+serde = { workspace = true }
+toml = "0.8"
+tracing = { workspace = true }
