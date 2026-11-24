@@ -1,0 +1,21 @@
+﻿//! AsterShell crate: filesystem
+
+#[derive(thiserror::Error, Debug)]
+pub enum Error {
+    #[error("Internal error in filesystem")]
+    Internal,
+}
+
+pub fn crate_name() -> &'static str {
+    "filesystem"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_crate_name() {
+        assert_eq!(crate_name(), "filesystem");
+    }
+}

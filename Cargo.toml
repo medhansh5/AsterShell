@@ -1,0 +1,77 @@
+[workspace]
+resolver = "2"
+members = [
+    "apps/shell-host",
+    "apps/taskbar",
+    "apps/search-ui",
+    "apps/start-menu",
+    "apps/desktop",
+    "apps/file-manager",
+    "apps/settings",
+    "crates/astercore",
+    "crates/platform-windows",
+    "crates/shell-api",
+    "crates/ipc",
+    "crates/process-supervisor",
+    "crates/window-tracker",
+    "crates/search-core",
+    "crates/search-providers",
+    "crates/search-index",
+    "crates/application-catalog",
+    "crates/filesystem",
+    "crates/configuration",
+    "crates/ui-components",
+    "crates/diagnostics",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.lints.cargo]
+unused_workspace_dependencies = "allow"
+unused_workspace_package_fields = "allow"
+
+[workspace.dependencies]
+# Serialization & IPC
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+postcard = { version = "1.0", features = ["alloc"] }
+
+# Async & Runtime
+tokio = { version = "1.40", features = ["full"] }
+tokio-util = "0.7"
+async-trait = "0.1"
+futures = "0.3"
+
+# Windows Platform Integration
+windows = "0.58"
+windows-sys = "0.59"
+
+# Logging & Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Database & Indexing
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Error Handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Local Crates
+astercore = { path = "crates/astercore" }
+platform-windows = { path = "crates/platform-windows" }
+shell-api = { path = "crates/shell-api" }
+ipc = { path = "crates/ipc" }
+process-supervisor = { path = "crates/process-supervisor" }
+window-tracker = { path = "crates/window-tracker" }
+search-core = { path = "crates/search-core" }
+search-providers = { path = "crates/search-providers" }
+search-index = { path = "crates/search-index" }
+application-catalog = { path = "crates/application-catalog" }
+filesystem = { path = "crates/filesystem" }
+configuration = { path = "crates/configuration" }
+ui-components = { path = "crates/ui-components" }
+diagnostics = { path = "crates/diagnostics" }
