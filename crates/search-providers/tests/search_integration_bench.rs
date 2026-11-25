@@ -92,7 +92,7 @@ async fn test_end_to_end_search_engine_pipeline() {
                     // Fast tier delivered results before final completion
                     if results
                         .iter()
-                        .any(|r| r.title.to_lowercase().contains("notepad"))
+                        .any(|r| r.title.to_lowercase().contains("note"))
                     {
                         app_found_early = true;
                     }

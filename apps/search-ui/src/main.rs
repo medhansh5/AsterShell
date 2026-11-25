@@ -7,13 +7,13 @@
 use astercore::ComponentId;
 use diagnostics::{init_diagnostics, DiagnosticConfig};
 use platform_windows::{
-    apply_dark_mode_and_backdrop, calculate_spotlight_coordinates, position_window,
-    register_global_hotkey, DwmBackdropType, HotkeyConfig,
+    apply_dark_mode_and_backdrop, calculate_spotlight_coordinates_with_dpi, get_window_dpi,
+    position_window, register_global_hotkey, DwmBackdropType, HotkeyConfig,
 };
 use search_core::{SearchEvent, SearchOrchestrator, SearchResult};
 use search_providers::{ApplicationDiscoveryProvider, CalculatorProvider, WindowsSearchProvider};
 use slint::{ComponentHandle, ModelRc, VecModel};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -326,6 +326,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Stored live search results matching current Slint view
     let current_results: Arc<Mutex<Vec<SearchResult>>> = Arc::new(Mutex::new(Vec::new()));
     let is_window_visible = Arc::new(AtomicBool::new(true));
+    let active_generation = Arc::new(AtomicU64::new(0));
 
     // Handle search input changes
     {
@@ -333,14 +334,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let rt = tokio_rt.clone();
         let win_weak = window_weak.clone();
         let cur_res_ref = current_results.clone();
+        let active_gen = active_generation.clone();
 
         main_window.on_search_input_changed(move |query_str| {
             let query = query_str.to_string();
             let orch_clone = orch.clone();
             let win_weak_inner = win_weak.clone();
             let cur_res_inner = cur_res_ref.clone();
+            let active_gen_inner = active_gen.clone();
 
             if query.trim().is_empty() {
+                // Invalidate any inflight query generation
+                active_gen_inner.fetch_add(1, Ordering::SeqCst);
                 if let Ok(mut l) = cur_res_inner.lock() {
                     l.clear();
                 }
@@ -357,14 +362,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 win.set_is_searching(true);
             }
 
+            let active_gen_task = active_gen_inner.clone();
             rt.spawn(async move {
                 let start = Instant::now();
-                let (_gen, mut rx) = {
+                let (gen, mut rx) = {
                     let locked = orch_clone.lock().await;
                     locked.execute_search(&query).await
                 };
+                active_gen_task.store(gen, Ordering::SeqCst);
 
                 while let Some(event) = rx.recv().await {
+                    let event_gen = event.generation();
+                    let cur_active = active_gen_task.load(Ordering::SeqCst);
+                    if event_gen != cur_active {
+                        tracing::debug!(
+                            event_gen,
+                            active_gen = cur_active,
+                            "Discarding stale search event for superseded generation"
+                        );
+                        if event_gen < cur_active {
+                            break;
+                        }
+                        continue;
+                    }
+
                     match event {
                         SearchEvent::ResultsUpdated { results, .. } => {
                             let duration_ms = start.elapsed().as_secs_f32() * 1000.0;
@@ -375,8 +396,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let win_weak_cb = win_weak_inner.clone();
                             let cur_res_cb = cur_res_inner.clone();
                             let results_saved = results.clone();
+                            let active_gen_ui = active_gen_task.clone();
 
                             let _ = slint::invoke_from_event_loop(move || {
+                                if active_gen_ui.load(Ordering::SeqCst) != event_gen {
+                                    return;
+                                }
                                 if let Some(win) = win_weak_cb.upgrade() {
                                     if let Ok(mut l) = cur_res_cb.lock() {
                                         *l = results_saved;
@@ -391,7 +416,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         SearchEvent::SearchCompleted { total_results, duration_ms, .. } => {
                             let win_weak_cb = win_weak_inner.clone();
+                            let active_gen_ui = active_gen_task.clone();
                             let _ = slint::invoke_from_event_loop(move || {
+                                if active_gen_ui.load(Ordering::SeqCst) != event_gen {
+                                    return;
+                                }
                                 if let Some(win) = win_weak_cb.upgrade() {
                                     win.set_is_searching(false);
                                     win.set_stats_text(
@@ -497,8 +526,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 if let Some(hwnd) = hwnd_opt {
                     let _ = apply_dark_mode_and_backdrop(hwnd, DwmBackdropType::Mica);
-                    if let Ok((x, y)) = calculate_spotlight_coordinates(640, 480) {
-                        let _ = position_window(hwnd, x, y, 640, 480);
+                    let dpi = get_window_dpi(hwnd);
+                    if let Ok((x, y, phys_w, phys_h)) =
+                        calculate_spotlight_coordinates_with_dpi(640, 480, dpi)
+                    {
+                        let _ = position_window(hwnd, x, y, phys_w, phys_h);
                     }
                 }
             }
@@ -538,8 +570,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .flatten();
 
                     if let Some(hwnd) = hwnd_opt {
-                        if let Ok((x, y)) = calculate_spotlight_coordinates(640, 480) {
-                            let _ = position_window(hwnd, x, y, 640, 480);
+                        let dpi = get_window_dpi(hwnd);
+                        if let Ok((x, y, phys_w, phys_h)) =
+                            calculate_spotlight_coordinates_with_dpi(640, 480, dpi)
+                        {
+                            let _ = position_window(hwnd, x, y, phys_w, phys_h);
                         }
                     }
                 }
@@ -651,5 +686,50 @@ mod tests {
             let (gen, _rx) = locked.execute_search("calc").await;
             assert_eq!(gen, 1);
         });
+    }
+
+    #[test]
+    fn test_generation_filtering_discards_stale_events() {
+        let active_gen = Arc::new(AtomicU64::new(5));
+
+        // Event from generation 4 (stale)
+        let stale_event = SearchEvent::ResultsUpdated {
+            generation: 4,
+            results: vec![],
+            is_final: false,
+        };
+        assert_ne!(
+            stale_event.generation(),
+            active_gen.load(Ordering::SeqCst),
+            "Stale generation must not match active generation"
+        );
+
+        // Event from generation 5 (current)
+        let current_event = SearchEvent::ResultsUpdated {
+            generation: 5,
+            results: vec![],
+            is_final: false,
+        };
+        assert_eq!(
+            current_event.generation(),
+            active_gen.load(Ordering::SeqCst),
+            "Current generation must match active generation"
+        );
+    }
+
+    #[test]
+    fn test_empty_query_increments_generation() {
+        let active_gen = Arc::new(AtomicU64::new(10));
+        let prev = active_gen.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(prev, 10);
+        assert_eq!(active_gen.load(Ordering::SeqCst), 11);
+
+        // Older event is now strictly less than active_gen
+        let old_event = SearchEvent::SearchCompleted {
+            generation: 10,
+            total_results: 5,
+            duration_ms: 10,
+        };
+        assert!(old_event.generation() < active_gen.load(Ordering::SeqCst));
     }
 }

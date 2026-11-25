@@ -162,6 +162,8 @@ async fn handle_client_connection(
     config_json: String,
     pid_registry: process_supervisor::SupervisedPidRegistry,
 ) {
+    let mut is_authenticated = false;
+
     loop {
         let req_res: Result<RequestEnvelope> = transport::read_framed_message(&mut stream).await;
         let req = match req_res {
@@ -179,6 +181,21 @@ async fn handle_client_connection(
                 client_version,
                 ref client_name,
             } => {
+                if is_authenticated {
+                    tracing::warn!(
+                        client = %client_name,
+                        "Protocol violation: connection already authenticated"
+                    );
+                    let resp_envelope = ResponseEnvelope {
+                        request_id: req.request_id,
+                        response: IpcResponse::Error(
+                            "Protocol violation: connection already authenticated".to_string(),
+                        ),
+                    };
+                    let _ = transport::write_framed_message(&mut stream, &resp_envelope).await;
+                    break;
+                }
+
                 let client_pid = platform_windows::get_pipe_client_pid(&stream).unwrap_or(0);
                 if !pid_registry.is_authorized(client_pid) {
                     tracing::warn!(
@@ -198,6 +215,7 @@ async fn handle_client_connection(
                     break;
                 }
 
+                is_authenticated = true;
                 tracing::info!(
                     client = %client_name,
                     client_version,
@@ -208,6 +226,20 @@ async fn handle_client_connection(
                     negotiated_version: PROTOCOL_VERSION_1,
                     server_pid: std::process::id(),
                 }
+            }
+            _ if !is_authenticated => {
+                tracing::warn!(
+                    "Unauthenticated request rejected: connection must authenticate via Handshake first"
+                );
+                let resp_envelope = ResponseEnvelope {
+                    request_id: req.request_id,
+                    response: IpcResponse::Error(
+                        "Authentication required: connection must authenticate via Handshake first"
+                            .to_string(),
+                    ),
+                };
+                let _ = transport::write_framed_message(&mut stream, &resp_envelope).await;
+                break;
             }
             IpcRequest::Ping { timestamp_ms } => IpcResponse::Pong { timestamp_ms },
             IpcRequest::GetConfig => IpcResponse::ConfigJson(config_json.clone()),
@@ -411,6 +443,272 @@ mod tests {
         );
 
         // Clean up daemon
+        daemon_task.abort();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_shell_host_rejects_ping_before_handshake() {
+        let test_pipe = format!(
+            r"\\.\pipe\astershell-test-unauth-ping-{}",
+            std::process::id()
+        );
+        let mut daemon =
+            ShellHostDaemon::new_with_pipe(&test_pipe).expect("Failed to initialize daemon");
+        daemon.authorize_pid(std::process::id());
+        let pipe_addr = daemon.pipe_address().to_string();
+
+        let daemon_task = tokio::spawn(async move {
+            let _ = daemon.run().await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let mut client = transport::connect_pipe_client(&pipe_addr)
+            .await
+            .expect("Client failed to connect to daemon pipe");
+
+        let req = RequestEnvelope {
+            request_id: 1,
+            request: IpcRequest::Ping {
+                timestamp_ms: 12345,
+            },
+        };
+        transport::write_framed_message(&mut client, &req)
+            .await
+            .unwrap();
+
+        let resp: ResponseEnvelope = transport::read_framed_message(&mut client).await.unwrap();
+        assert_eq!(resp.request_id, 1);
+        match resp.response {
+            IpcResponse::Error(msg) => {
+                assert!(
+                    msg.contains("Authentication required"),
+                    "Expected authentication required error, got: {}",
+                    msg
+                );
+            }
+            other => panic!("Expected IpcResponse::Error, got {:?}", other),
+        }
+
+        let read_after: Result<ResponseEnvelope> =
+            transport::read_framed_message(&mut client).await;
+        assert!(read_after.is_err(), "Pipe should be disconnected by server");
+
+        daemon_task.abort();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_shell_host_rejects_get_config_before_handshake() {
+        let test_pipe = format!(
+            r"\\.\pipe\astershell-test-unauth-cfg-{}",
+            std::process::id()
+        );
+        let mut daemon =
+            ShellHostDaemon::new_with_pipe(&test_pipe).expect("Failed to initialize daemon");
+        daemon.authorize_pid(std::process::id());
+        let pipe_addr = daemon.pipe_address().to_string();
+
+        let daemon_task = tokio::spawn(async move {
+            let _ = daemon.run().await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let mut client = transport::connect_pipe_client(&pipe_addr)
+            .await
+            .expect("Client failed to connect to daemon pipe");
+
+        let req = RequestEnvelope {
+            request_id: 1,
+            request: IpcRequest::GetConfig,
+        };
+        transport::write_framed_message(&mut client, &req)
+            .await
+            .unwrap();
+
+        let resp: ResponseEnvelope = transport::read_framed_message(&mut client).await.unwrap();
+        assert_eq!(resp.request_id, 1);
+        match resp.response {
+            IpcResponse::Error(msg) => {
+                assert!(
+                    msg.contains("Authentication required"),
+                    "Expected authentication required error, got: {}",
+                    msg
+                );
+            }
+            other => panic!("Expected IpcResponse::Error, got {:?}", other),
+        }
+
+        daemon_task.abort();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_shell_host_rejects_discover_apps_before_handshake() {
+        let test_pipe = format!(
+            r"\\.\pipe\astershell-test-unauth-apps-{}",
+            std::process::id()
+        );
+        let mut daemon =
+            ShellHostDaemon::new_with_pipe(&test_pipe).expect("Failed to initialize daemon");
+        daemon.authorize_pid(std::process::id());
+        let pipe_addr = daemon.pipe_address().to_string();
+
+        let daemon_task = tokio::spawn(async move {
+            let _ = daemon.run().await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let mut client = transport::connect_pipe_client(&pipe_addr)
+            .await
+            .expect("Client failed to connect to daemon pipe");
+
+        let req = RequestEnvelope {
+            request_id: 1,
+            request: IpcRequest::DiscoverApps,
+        };
+        transport::write_framed_message(&mut client, &req)
+            .await
+            .unwrap();
+
+        let resp: ResponseEnvelope = transport::read_framed_message(&mut client).await.unwrap();
+        assert_eq!(resp.request_id, 1);
+        match resp.response {
+            IpcResponse::Error(msg) => {
+                assert!(
+                    msg.contains("Authentication required"),
+                    "Expected authentication required error, got: {}",
+                    msg
+                );
+            }
+            other => panic!("Expected IpcResponse::Error, got {:?}", other),
+        }
+
+        daemon_task.abort();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_shell_host_rejects_shutdown_before_handshake() {
+        let test_pipe = format!(
+            r"\\.\pipe\astershell-test-unauth-shut-{}",
+            std::process::id()
+        );
+        let mut daemon =
+            ShellHostDaemon::new_with_pipe(&test_pipe).expect("Failed to initialize daemon");
+        daemon.authorize_pid(std::process::id());
+        let pipe_addr = daemon.pipe_address().to_string();
+
+        let daemon_task = tokio::spawn(async move {
+            let _ = daemon.run().await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let mut client = transport::connect_pipe_client(&pipe_addr)
+            .await
+            .expect("Client failed to connect to daemon pipe");
+
+        let req = RequestEnvelope {
+            request_id: 1,
+            request: IpcRequest::Shutdown,
+        };
+        transport::write_framed_message(&mut client, &req)
+            .await
+            .unwrap();
+
+        let resp: ResponseEnvelope = transport::read_framed_message(&mut client).await.unwrap();
+        assert_eq!(resp.request_id, 1);
+        match resp.response {
+            IpcResponse::Error(msg) => {
+                assert!(
+                    msg.contains("Authentication required"),
+                    "Expected authentication required error, got: {}",
+                    msg
+                );
+            }
+            other => panic!("Expected IpcResponse::Error, got {:?}", other),
+        }
+
+        assert!(
+            !daemon_task.is_finished(),
+            "Daemon must not shut down from unauthenticated request"
+        );
+
+        daemon_task.abort();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_shell_host_rejects_duplicate_handshake() {
+        let test_pipe = format!(
+            r"\\.\pipe\astershell-test-dup-handshake-{}",
+            std::process::id()
+        );
+        let mut daemon =
+            ShellHostDaemon::new_with_pipe(&test_pipe).expect("Failed to initialize daemon");
+        daemon.authorize_pid(std::process::id());
+        let pipe_addr = daemon.pipe_address().to_string();
+
+        let daemon_task = tokio::spawn(async move {
+            let _ = daemon.run().await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let mut client = transport::connect_pipe_client(&pipe_addr)
+            .await
+            .expect("Client failed to connect to daemon pipe");
+
+        // 1st Handshake: should succeed
+        let req1 = RequestEnvelope {
+            request_id: 1,
+            request: IpcRequest::Handshake {
+                client_version: PROTOCOL_VERSION_1,
+                client_name: "valid-client".into(),
+            },
+        };
+        transport::write_framed_message(&mut client, &req1)
+            .await
+            .unwrap();
+        let resp1: ResponseEnvelope = transport::read_framed_message(&mut client).await.unwrap();
+        assert_eq!(resp1.request_id, 1);
+        assert!(matches!(resp1.response, IpcResponse::HandshakeAck { .. }));
+
+        // 2nd Handshake on same connection: protocol violation
+        let req2 = RequestEnvelope {
+            request_id: 2,
+            request: IpcRequest::Handshake {
+                client_version: PROTOCOL_VERSION_1,
+                client_name: "valid-client".into(),
+            },
+        };
+        transport::write_framed_message(&mut client, &req2)
+            .await
+            .unwrap();
+        let resp2: ResponseEnvelope = transport::read_framed_message(&mut client).await.unwrap();
+        assert_eq!(resp2.request_id, 2);
+        match resp2.response {
+            IpcResponse::Error(msg) => {
+                assert!(
+                    msg.contains("already authenticated"),
+                    "Expected already authenticated error, got: {}",
+                    msg
+                );
+            }
+            other => panic!("Expected IpcResponse::Error, got {:?}", other),
+        }
+
+        let read_after: Result<ResponseEnvelope> =
+            transport::read_framed_message(&mut client).await;
+        assert!(
+            read_after.is_err(),
+            "Pipe should be closed after protocol violation"
+        );
+
         daemon_task.abort();
     }
 }

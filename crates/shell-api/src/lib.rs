@@ -50,11 +50,84 @@ pub fn validate_uri_scheme(uri: &str) -> Result<(), LaunchError> {
     Ok(())
 }
 
+/// Validates an Application User Model ID (AUMID) or shell:AppsFolder target.
+///
+/// Strips any `shell:AppsFolder\` prefix and verifies that the remaining identifier contains
+/// only allowed characters (alphanumeric, `.`, `-`, `_`, `!`, `{`, `}`) and no shell meta-characters
+/// or whitespace.
+pub fn validate_aumid(aumid: &str) -> Result<String, LaunchError> {
+    let trimmed = aumid.trim();
+    if trimmed.is_empty() {
+        return Err(LaunchError::InvalidTarget(
+            "AUMID cannot be empty".to_string(),
+        ));
+    }
+
+    let clean = if let Some(stripped) = trimmed.strip_prefix(r"shell:AppsFolder\") {
+        stripped
+    } else if let Some(stripped) = trimmed.strip_prefix("shell:AppsFolder/") {
+        stripped
+    } else {
+        trimmed
+    };
+
+    if clean.is_empty() {
+        return Err(LaunchError::InvalidTarget(
+            "AUMID cannot be empty after stripping shell:AppsFolder prefix".to_string(),
+        ));
+    }
+
+    for ch in clean.chars() {
+        let is_valid_char = ch.is_ascii_alphanumeric()
+            || ch == '.'
+            || ch == '-'
+            || ch == '_'
+            || ch == '!'
+            || ch == '{'
+            || ch == '}';
+        if !is_valid_char {
+            return Err(LaunchError::InvalidTarget(format!(
+                "Disallowed character '{}' in AUMID '{}'",
+                ch, clean
+            )));
+        }
+    }
+
+    Ok(clean.to_string())
+}
+
+/// Activates a Windows packaged application using its AUMID via shell:AppsFolder.
+pub fn activate_packaged_application(
+    aumid: &str,
+    arguments: Option<&str>,
+) -> Result<(), LaunchError> {
+    let clean_aumid = validate_aumid(aumid)?;
+    let target = format!(r"shell:AppsFolder\{}", clean_aumid);
+
+    tracing::info!(
+        aumid = %clean_aumid,
+        args = ?arguments,
+        "Activating packaged application via shell:AppsFolder"
+    );
+
+    #[cfg(windows)]
+    {
+        shell_execute_open(&target, arguments)?;
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = (target, arguments);
+    }
+
+    Ok(())
+}
+
 /// Copies UTF-8 text into the Windows system clipboard.
 pub fn copy_to_system_clipboard(text: &str) -> Result<(), LaunchError> {
     #[cfg(windows)]
     {
-        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::Foundation::{GlobalFree, HANDLE};
         use windows::Win32::System::DataExchange::{
             CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
         };
@@ -97,6 +170,8 @@ pub fn copy_to_system_clipboard(text: &str) -> Result<(), LaunchError> {
             let _ = CloseClipboard();
 
             if let Err(e) = set_res {
+                // SAFETY: SetClipboardData failed; system did not take ownership of hmem.
+                let _ = GlobalFree(hmem);
                 return Err(LaunchError::ClipboardError(format!(
                     "SetClipboardData failed: {}",
                     e
@@ -155,11 +230,22 @@ fn shell_execute_open(path: &str, args: Option<&str>) -> Result<(), LaunchError>
 /// Executes a `LaunchTarget` safely according to its specific activation rules.
 pub fn launch_target(target: &LaunchTarget) -> Result<(), LaunchError> {
     match target {
+        LaunchTarget::PackagedApplication { aumid, arguments } => {
+            activate_packaged_application(aumid, arguments.as_deref())
+        }
         LaunchTarget::Executable {
             path,
             arguments,
             working_directory,
         } => {
+            // Check if executable target is an AUMID or shell:AppsFolder package reference
+            if path.starts_with(r"shell:AppsFolder\")
+                || path.starts_with("shell:AppsFolder/")
+                || (path.contains('!') && !Path::new(path).exists())
+            {
+                return activate_packaged_application(path, None);
+            }
+
             validate_file_path(path)?;
 
             tracing::info!(path = %path, args = ?arguments, "Launching executable target");
@@ -302,6 +388,88 @@ mod tests {
         assert!(matches!(
             launch_target(&invalid),
             Err(LaunchError::UnsupportedAction(_))
+        ));
+    }
+
+    #[test]
+    fn test_validate_aumid_valid() {
+        assert_eq!(
+            validate_aumid("Microsoft.WindowsCalculator_8wekyb3d8bbwe!App").unwrap(),
+            "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"
+        );
+        assert_eq!(
+            validate_aumid(r"shell:AppsFolder\Microsoft.WindowsCalculator_8wekyb3d8bbwe!App")
+                .unwrap(),
+            "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"
+        );
+        assert_eq!(
+            validate_aumid("shell:AppsFolder/Microsoft.WindowsTerminal_8wekyb3d8bbwe!App").unwrap(),
+            "Microsoft.WindowsTerminal_8wekyb3d8bbwe!App"
+        );
+        assert_eq!(
+            validate_aumid("windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel").unwrap(),
+            "windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel"
+        );
+    }
+
+    #[test]
+    fn test_validate_aumid_invalid() {
+        assert!(matches!(
+            validate_aumid(""),
+            Err(LaunchError::InvalidTarget(_))
+        ));
+        assert!(matches!(
+            validate_aumid("   "),
+            Err(LaunchError::InvalidTarget(_))
+        ));
+        assert!(matches!(
+            validate_aumid(r"shell:AppsFolder\"),
+            Err(LaunchError::InvalidTarget(_))
+        ));
+        assert!(matches!(
+            validate_aumid("calc.exe & rm -rf /"),
+            Err(LaunchError::InvalidTarget(_))
+        ));
+        assert!(matches!(
+            validate_aumid("app; calc.exe"),
+            Err(LaunchError::InvalidTarget(_))
+        ));
+        assert!(matches!(
+            validate_aumid("app| powershell"),
+            Err(LaunchError::InvalidTarget(_))
+        ));
+        assert!(matches!(
+            validate_aumid("app\"quote"),
+            Err(LaunchError::InvalidTarget(_))
+        ));
+        assert!(matches!(
+            validate_aumid("app with spaces"),
+            Err(LaunchError::InvalidTarget(_))
+        ));
+    }
+
+    #[test]
+    fn test_launch_target_packaged_application_validation() {
+        let invalid_target = LaunchTarget::PackagedApplication {
+            aumid: "malicious & calc.exe".into(),
+            arguments: None,
+        };
+        assert!(matches!(
+            launch_target(&invalid_target),
+            Err(LaunchError::InvalidTarget(_))
+        ));
+    }
+
+    #[test]
+    fn test_launch_target_executable_fallback_validation() {
+        let invalid_exe_target = LaunchTarget::Executable {
+            path: "shell:AppsFolder\\malicious | powershell".into(),
+            arguments: vec![],
+            working_directory: None,
+        };
+        assert!(matches!(
+            launch_target(&invalid_exe_target),
+            Err(LaunchError::InvalidTarget(_))
         ));
     }
 }

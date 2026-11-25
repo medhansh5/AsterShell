@@ -36,6 +36,10 @@ pub enum LaunchTarget {
     CopyToClipboard {
         text: String,
     },
+    PackagedApplication {
+        aumid: String,
+        arguments: Option<String>,
+    },
 }
 
 impl LaunchTarget {
@@ -47,6 +51,7 @@ impl LaunchTarget {
             Self::Uri { uri } => format!("uri:{}", uri.to_lowercase()),
             Self::Action { action_id } => format!("act:{}", action_id.to_lowercase()),
             Self::CopyToClipboard { text } => format!("clip:{}", text),
+            Self::PackagedApplication { aumid, .. } => format!("pkg:{}", aumid.to_lowercase()),
         }
     }
 }
@@ -177,4 +182,17 @@ pub enum SearchEvent {
         provider_id: Option<String>,
         error: String,
     },
+}
+
+impl SearchEvent {
+    /// Returns the generation number associated with this search event.
+    pub fn generation(&self) -> u64 {
+        match self {
+            SearchEvent::SearchStarted { generation, .. } => *generation,
+            SearchEvent::ResultsUpdated { generation, .. } => *generation,
+            SearchEvent::ProviderCompleted { generation, .. } => *generation,
+            SearchEvent::SearchCompleted { generation, .. } => *generation,
+            SearchEvent::SearchFailed { generation, .. } => *generation,
+        }
+    }
 }

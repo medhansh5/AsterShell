@@ -97,9 +97,9 @@
 ### 3.1 Generated SQL Structure [PASS]
 - **Generated Template:**
   ```sql
-  SELECT TOP 20 System.ItemName, System.ItemUrl, System.Size, System.DateModified, System.Search.Rank 
-  FROM SystemIndex 
-  WHERE SCOPE='file:' AND CONTAINS(System.ItemName, '"*<sanitized_query>*"') 
+  SELECT TOP 20 System.ItemName, System.ItemUrl, System.Size, System.DateModified, System.Search.Rank
+  FROM SystemIndex
+  WHERE SCOPE='file:' AND CONTAINS(System.ItemName, '"*<sanitized_query>*"')
   ORDER BY System.Search.Rank DESC
   ```
 
@@ -229,7 +229,7 @@
 
 ### **VERDICT: APPROVE M2 WITH CONDITIONS**
 
-**Verdict Justification:**  
+**Verdict Justification:**
 The search infrastructure implemented in Milestone 1B is robust, exceptionally fast (warm application p95 at **0.25 ms**, beating the 100 ms target by 300x), and completely decoupled behind clean asynchronous boundaries. The test suite passes 100% (62/62 tests), Clippy and rustfmt are clean with zero warnings, and companion mode is preserved without touching system Winlogon registry keys.
 
 ### Authorized Conditions for Milestone 2:

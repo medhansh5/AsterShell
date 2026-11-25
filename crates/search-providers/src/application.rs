@@ -116,10 +116,17 @@ impl SearchProvider for ApplicationDiscoveryProvider {
             let score_opt = calculate_app_match_score(q_norm, &app_name_lower);
 
             if let Some((score, match_kind)) = score_opt {
-                let launch_target = LaunchTarget::Executable {
-                    path: app.executable_or_aumid.clone(),
-                    arguments: Vec::new(),
-                    working_directory: None,
+                let launch_target = if app.is_packaged {
+                    LaunchTarget::PackagedApplication {
+                        aumid: app.executable_or_aumid.clone(),
+                        arguments: None,
+                    }
+                } else {
+                    LaunchTarget::Executable {
+                        path: app.executable_or_aumid.clone(),
+                        arguments: Vec::new(),
+                        working_directory: None,
+                    }
                 };
 
                 let meta = RankingMetadata {

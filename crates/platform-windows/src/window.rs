@@ -188,6 +188,52 @@ pub fn get_active_monitor_work_area() -> Result<Rect> {
     }
 }
 
+/// Queries the effective DPI for a given Win32 window HWND.
+/// Returns 96 if unable to query or on non-Windows platforms.
+pub fn get_window_dpi(hwnd: isize) -> u32 {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::HiDpi::GetDpiForWindow;
+        unsafe {
+            let dpi = GetDpiForWindow(HWND(hwnd as _));
+            if dpi == 0 {
+                96
+            } else {
+                dpi
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = hwnd;
+        96
+    }
+}
+
+/// Scales a logical pixel dimension to physical device pixels based on the given DPI.
+pub fn scale_to_physical_pixels(logical_size: i32, dpi: u32) -> i32 {
+    let effective_dpi = if dpi == 0 { 96 } else { dpi };
+    (logical_size * effective_dpi as i32) / 96
+}
+
+/// Computes the centered (X, Y) coordinate and physical dimensions for a spotlight window
+/// taking into account the window's effective DPI on the target monitor.
+/// Places the window horizontally centered and ~20% from the top of the active monitor's work area.
+pub fn calculate_spotlight_coordinates_with_dpi(
+    logical_width: i32,
+    logical_height: i32,
+    dpi: u32,
+) -> Result<(i32, i32, i32, i32)> {
+    let work = get_active_monitor_work_area()?;
+    let physical_width = scale_to_physical_pixels(logical_width, dpi);
+    let physical_height = scale_to_physical_pixels(logical_height, dpi);
+
+    let x = work.left + (work.width() - physical_width) / 2;
+    let y = work.top + (work.height() * 20 / 100);
+    Ok((x, y, physical_width, physical_height))
+}
+
 /// Computes the centered (X, Y) coordinate for a spotlight window of given dimensions
 /// located horizontally centered and placed at ~20% from the top of the active monitor's work area.
 pub fn calculate_spotlight_coordinates(

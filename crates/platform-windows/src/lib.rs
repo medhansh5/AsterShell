@@ -5,8 +5,9 @@ pub mod window;
 
 pub use hotkey::{register_global_hotkey, GlobalHotkeyHandle, HotkeyConfig, HotkeyError};
 pub use window::{
-    apply_dark_mode_and_backdrop, calculate_spotlight_coordinates, get_active_monitor_work_area,
-    position_window, DwmBackdropType, Rect,
+    apply_dark_mode_and_backdrop, calculate_spotlight_coordinates,
+    calculate_spotlight_coordinates_with_dpi, get_active_monitor_work_area, get_window_dpi,
+    position_window, scale_to_physical_pixels, DwmBackdropType, Rect,
 };
 
 use astercore::{AsterError, Result};
@@ -434,6 +435,26 @@ mod tests {
         assert!(!config.win);
         assert_eq!(config.vk_code, 0x20);
         assert!(config.no_repeat);
+    }
+
+    #[test]
+    fn test_dpi_scaling_and_coordinates() {
+        // Standard 100% DPI (96)
+        assert_eq!(scale_to_physical_pixels(640, 96), 640);
+        assert_eq!(scale_to_physical_pixels(480, 96), 480);
+
+        // 125% DPI (120)
+        assert_eq!(scale_to_physical_pixels(640, 120), 800);
+        assert_eq!(scale_to_physical_pixels(480, 120), 600);
+
+        // 150% DPI (144)
+        assert_eq!(scale_to_physical_pixels(640, 144), 960);
+        assert_eq!(scale_to_physical_pixels(480, 144), 720);
+
+        // Coordinates with 125% DPI
+        let res = calculate_spotlight_coordinates_with_dpi(640, 480, 120).unwrap();
+        assert_eq!(res.2, 800);
+        assert_eq!(res.3, 600);
     }
 
     #[test]

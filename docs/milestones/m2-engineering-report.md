@@ -1,11 +1,11 @@
 # AsterShell — Milestone 2 Engineering Report
 
-**Milestone:** M2 — Spotlight Interface (`apps/search-ui`)  
-**Baseline Commit:** `ca5cd881d33c60e56a0d04b60177fc73a4b9f596` (M1B)  
-**Date:** 2026-11-25  
-**Target Platform:** Windows 11 Pro (Build 26300, 64-bit)  
-**Rust Version:** 1.100.0 (x86_64-pc-windows-msvc)  
-**UI Framework:** Slint 1.19.1 (`backend-winit`, `unstable-winit-030`)  
+**Milestone:** M2 — Spotlight Interface (`apps/search-ui`)
+**Baseline Commit:** `ca5cd881d33c60e56a0d04b60177fc73a4b9f596` (M1B)
+**Date:** 2026-11-25
+**Target Platform:** Windows 11 Pro (Build 26300, 64-bit)
+**Rust Version:** 1.100.0 (x86_64-pc-windows-msvc)
+**UI Framework:** Slint 1.19.1 (`backend-winit`, `unstable-winit-030`)
 **Final Status:** **COMPLETE**
 
 ---
@@ -37,23 +37,23 @@ The resulting application provides an original, minimalist dark visual language 
 graph TD
     User([User Keyboard / Alt+Space]) --> HK[platform-windows: GlobalHotkeyHandle]
     HK -->|Post Message Pump| SLINT[apps/search-ui: Slint Spotlight Window]
-    
+
     SLINT -->|TextInput on_search_input_changed| ORCH[search-core: SearchOrchestrator]
     ORCH -->|Parallel Async Queries| FAST[search-providers: ApplicationDiscovery]
     ORCH -->|Instant Math| CALC[search-providers: CalculatorProvider]
     ORCH -->|Dedicated COM MTA Thread| WINSEARCH[search-providers: WindowsSearchProvider]
-    
+
     FAST -->|Incremental Results| RX[Generational mpsc Channel]
     CALC -->|Incremental Results| RX
     WINSEARCH -->|Incremental Results| RX
-    
+
     RX -->|slint::invoke_from_event_loop| SLINT
-    
+
     SLINT -->|Enter / Selection| LAUNCH[shell-api: launch_target]
     LAUNCH -->|Direct Spawn| EXE[std::process::Command]
     LAUNCH -->|Shell Verb| SHELLEXEC[Win32 ShellExecuteExW]
     LAUNCH -->|Clipboard API| CLIP[Win32 SetClipboardData]
-    
+
     SUPERVISOR[apps/shell-host: ProcessSupervisor] -->|Track Supervised PID| REG[SupervisedPidRegistry]
     SLINT -.->|Named Pipe Handshake| IPC[ipc: Named Pipe Server]
     IPC -->|get_pipe_client_pid| REG
@@ -113,18 +113,18 @@ Empirical micro-benchmarks and integration benchmarks executed on Windows 11 Pro
 
 ```
 ==========================================================================
-                   ASTERSHELL SEARCH ENGINE BENCHMARK SUITE               
+                   ASTERSHELL SEARCH ENGINE BENCHMARK SUITE
 ==========================================================================
  Environment: Windows 11 Pro (Build 26300, 64-bit), Sample Size: 50 runs
  Target: Warm application search p95 < 100 ms (flagship performance requirement)
 --------------------------------------------------------------------------
- Metric                              |   p50 (ms)  |   p95 (ms)  |   p99 (ms) 
+ Metric                              |   p50 (ms)  |   p95 (ms)  |   p99 (ms)
 -------------------------------------+-------------+-------------+------------
- Warm Application Search (End-to-End)|      0.17   |      0.23   |      0.54  
- Time to First Result (Incremental)  |      0.18   |      0.22   |      --    
- Local Calculator Evaluation         |      0.20   |      0.38   |      --    
- Windows Search Query Latency (Warm) |     11.05   |     13.82   |     21.16  
- Tokio Search Cancellation Latency   |      0.05   |      0.08   |      --    
+ Warm Application Search (End-to-End)|      0.17   |      0.23   |      0.54
+ Time to First Result (Incremental)  |      0.18   |      0.22   |      --
+ Local Calculator Evaluation         |      0.20   |      0.38   |      --
+ Windows Search Query Latency (Warm) |     11.05   |     13.82   |     21.16
+ Tokio Search Cancellation Latency   |      0.05   |      0.08   |      --
 ==========================================================================
 ```
 
