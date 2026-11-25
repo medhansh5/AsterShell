@@ -2,34 +2,46 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [master]
   pull_request:
-    branches: [main]
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
 
 jobs:
-  check-and-test:
-    name: Build, Lint and Test (Windows)
+  quality-gates:
+    name: Windows Quality Gates
     runs-on: windows-latest
+    timeout-minutes: 25
+
     steps:
       - name: Checkout Source Code
         uses: actions/checkout@v4
 
-      - name: Setup Rust Stable Toolchain
+      - name: Setup Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
       - name: Cache Cargo Dependencies
         uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
 
-      - name: Check Formatting
+      - name: Gate 1 — Check Formatting (cargo fmt)
         run: cargo fmt --all -- --check
 
-      - name: Run Clippy Linter
-        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Gate 2 — Workspace Compilation (cargo check)
+        run: cargo check --workspace --all-targets --locked
 
-      - name: Run Workspace Tests
-        run: cargo test --workspace --verbose
+      - name: Gate 3 — Strict Linter (cargo clippy)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Gate 4 — Workspace Test Suite (cargo test)
+        run: cargo test --workspace --locked --verbose
