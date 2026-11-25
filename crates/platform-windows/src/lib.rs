@@ -1,5 +1,14 @@
 //! AsterShell Platform Layer — Windows API and System Abstractions
 
+pub mod hotkey;
+pub mod window;
+
+pub use hotkey::{register_global_hotkey, GlobalHotkeyHandle, HotkeyConfig, HotkeyError};
+pub use window::{
+    apply_dark_mode_and_backdrop, calculate_spotlight_coordinates, get_active_monitor_work_area,
+    position_window, DwmBackdropType, Rect,
+};
+
 use astercore::{AsterError, Result};
 use std::fmt;
 
@@ -414,5 +423,55 @@ mod tests {
             .expect("Should construct PipeSecurityDescriptor from valid SDDL");
         assert!(!desc.as_raw_mut_ptr().is_null());
         assert_eq!(desc.sddl(), sddl);
+    }
+
+    #[test]
+    fn test_hotkey_config_defaults() {
+        let config = HotkeyConfig::alt_space();
+        assert!(config.alt);
+        assert!(!config.ctrl);
+        assert!(!config.shift);
+        assert!(!config.win);
+        assert_eq!(config.vk_code, 0x20);
+        assert!(config.no_repeat);
+    }
+
+    #[test]
+    fn test_active_monitor_work_area_and_coordinates() {
+        let work_res = get_active_monitor_work_area();
+        assert!(
+            work_res.is_ok(),
+            "Should retrieve active monitor work area: {:?}",
+            work_res.err()
+        );
+        let work = work_res.unwrap();
+        assert!(work.width() > 0);
+        assert!(work.height() > 0);
+
+        let coords_res = calculate_spotlight_coordinates(640, 480);
+        assert!(coords_res.is_ok());
+        let (x, y) = coords_res.unwrap();
+        assert!(x >= work.left);
+        assert!(y >= work.top);
+    }
+
+    #[test]
+    fn test_hotkey_registration_and_clean_drop() {
+        // Register a test hotkey (e.g. Ctrl + Alt + F12) to verify registration & unregistration loop
+        let config = HotkeyConfig::new(0x7B /* VK_F12 */, true, true, false, false);
+        let res = register_global_hotkey(config, || {});
+        // In CI or test environments, hotkey registration succeeds or yields already registered
+        match res {
+            Ok(handle) => {
+                assert!(handle.thread_id != 0);
+                drop(handle); // Verify drop cleanly stops thread and unregisters
+            }
+            Err(HotkeyError::AlreadyRegistered) => {
+                // Also acceptable if already taken in this environment
+            }
+            Err(e) => {
+                panic!("Unexpected error registering hotkey: {:?}", e);
+            }
+        }
     }
 }

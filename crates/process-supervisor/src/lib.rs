@@ -1,10 +1,66 @@
-﻿//! AsterShell Process Supervisor Subsystem
+//! AsterShell Process Supervisor Subsystem
 
 use astercore::{AsterError, ComponentId, ProcessStatus, RestartPolicy, Result};
 use platform_windows::JobObject;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
+
+/// Thread-safe registry of authorized supervised process IDs for mutual authentication.
+#[derive(Debug, Clone)]
+pub struct SupervisedPidRegistry {
+    authorized_pids: Arc<RwLock<HashSet<u32>>>,
+    strict: bool,
+}
+
+impl SupervisedPidRegistry {
+    pub fn new(strict: bool) -> Self {
+        Self {
+            authorized_pids: Arc::new(RwLock::new(HashSet::new())),
+            strict,
+        }
+    }
+
+    pub fn authorize(&self, pid: u32) {
+        if pid != 0 {
+            if let Ok(mut lock) = self.authorized_pids.write() {
+                lock.insert(pid);
+            }
+        }
+    }
+
+    pub fn deauthorize(&self, pid: u32) {
+        if let Ok(mut lock) = self.authorized_pids.write() {
+            lock.remove(&pid);
+        }
+    }
+
+    pub fn is_authorized(&self, pid: u32) -> bool {
+        if !self.strict {
+            return true;
+        }
+        if let Ok(lock) = self.authorized_pids.read() {
+            lock.contains(&pid)
+        } else {
+            false
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.authorized_pids.read().map(|l| l.len()).unwrap_or(0)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl Default for SupervisedPidRegistry {
+    fn default() -> Self {
+        Self::new(true)
+    }
+}
 
 /// Specification for launching a managed child process.
 #[derive(Debug, Clone)]
@@ -114,6 +170,7 @@ impl RestartPolicyExt for RestartPolicy {
 pub struct ProcessSupervisor {
     job_object: JobObject,
     processes: HashMap<ComponentId, ManagedChild>,
+    pid_registry: SupervisedPidRegistry,
 }
 
 impl ProcessSupervisor {
@@ -121,7 +178,41 @@ impl ProcessSupervisor {
         Self {
             job_object,
             processes: HashMap::new(),
+            pid_registry: SupervisedPidRegistry::new(true),
         }
+    }
+
+    pub fn new_with_registry(job_object: JobObject, registry: SupervisedPidRegistry) -> Self {
+        Self {
+            job_object,
+            processes: HashMap::new(),
+            pid_registry: registry,
+        }
+    }
+
+    pub fn pid_registry(&self) -> SupervisedPidRegistry {
+        self.pid_registry.clone()
+    }
+
+    pub fn child_pid(&self, id: ComponentId) -> Option<u32> {
+        self.processes
+            .get(&id)
+            .and_then(|m| m.child.as_ref().and_then(|c| c.id()))
+    }
+
+    pub fn is_supervised_pid(&self, pid: u32) -> bool {
+        self.pid_registry.is_authorized(pid)
+    }
+
+    pub fn identify_child(&self, pid: u32) -> Option<ComponentId> {
+        for (&id, managed) in &self.processes {
+            if let Some(ref child) = managed.child {
+                if child.id() == Some(pid) {
+                    return Some(id);
+                }
+            }
+        }
+        None
     }
 
     pub fn register(&mut self, spec: ProcessSpec) {
@@ -157,6 +248,10 @@ impl ProcessSupervisor {
             let _ = self.job_object.assign_raw_handle(raw_h as _);
         }
 
+        if pid != 0 {
+            self.pid_registry.authorize(pid);
+        }
+
         managed.child = Some(child);
         managed.status = ProcessStatus::Running;
         tracing::info!(process = id.as_str(), pid, "Spawned supervised process");
@@ -184,6 +279,10 @@ impl ProcessSupervisor {
             if let Some(ref mut child) = managed.child {
                 match child.try_wait() {
                     Ok(Some(status)) => {
+                        let old_pid = child.id().unwrap_or(0);
+                        if old_pid != 0 {
+                            self.pid_registry.deauthorize(old_pid);
+                        }
                         let code = status.code().map(|c| c as u32);
                         let action = managed.evaluate_crash(code);
                         managed.child = None;
@@ -209,6 +308,9 @@ impl ProcessSupervisor {
 
         for (&id, managed) in self.processes.iter_mut() {
             if let Some(mut child) = managed.child.take() {
+                if let Some(pid) = child.id() {
+                    self.pid_registry.deauthorize(pid);
+                }
                 tracing::debug!(process = id.as_str(), "Terminating child process");
                 let _ = child.start_kill();
             }
@@ -325,5 +427,29 @@ mod tests {
             }
             other => panic!("Expected BackoffDelay, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_supervised_pid_registry_lifecycle() {
+        let registry = SupervisedPidRegistry::new(true);
+        assert!(registry.is_empty());
+        assert!(!registry.is_authorized(1234));
+
+        registry.authorize(1234);
+        assert_eq!(registry.len(), 1);
+        assert!(registry.is_authorized(1234));
+        assert!(!registry.is_authorized(5678));
+
+        registry.authorize(5678);
+        assert_eq!(registry.len(), 2);
+        assert!(registry.is_authorized(5678));
+
+        registry.deauthorize(1234);
+        assert_eq!(registry.len(), 1);
+        assert!(!registry.is_authorized(1234));
+        assert!(registry.is_authorized(5678));
+
+        let non_strict = SupervisedPidRegistry::new(false);
+        assert!(non_strict.is_authorized(99999));
     }
 }

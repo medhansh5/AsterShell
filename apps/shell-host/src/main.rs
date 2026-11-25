@@ -25,18 +25,21 @@ pub struct ShellHostDaemon {
 
 impl ShellHostDaemon {
     pub fn new() -> Result<Self> {
+        Self::new_with_pipe(&default_pipe_address())
+    }
+
+    pub fn new_with_pipe(pipe_address: &str) -> Result<Self> {
         let config_path = default_config_path();
         let config = load_config_from_path(&config_path)?;
 
         let job_object = JobObject::create("AsterShellHostJob")?;
         let supervisor = ProcessSupervisor::new(job_object);
-        let pipe_address = default_pipe_address();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         Ok(Self {
             config,
             supervisor,
-            pipe_address,
+            pipe_address: pipe_address.to_string(),
             shutdown_tx,
             shutdown_rx,
             is_running: Arc::new(AtomicBool::new(false)),
@@ -49,6 +52,14 @@ impl ShellHostDaemon {
 
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    pub fn authorize_pid(&self, pid: u32) {
+        self.supervisor.pid_registry().authorize(pid);
+    }
+
+    pub fn supervisor_mut(&mut self) -> &mut ProcessSupervisor {
+        &mut self.supervisor
     }
 
     pub async fn run(&mut self) -> Result<()> {
@@ -64,6 +75,7 @@ impl ShellHostDaemon {
         let pipe_addr = self.pipe_address.clone();
         let is_running = self.is_running.clone();
         let config_json = serde_json::to_string(&self.config).unwrap_or_default();
+        let pid_registry = self.supervisor.pid_registry();
 
         // Spawn IPC Named Pipe Listener
         let ipc_task = tokio::spawn(async move {
@@ -83,11 +95,12 @@ impl ShellHostDaemon {
                             is_first = false;
                             let s_tx = shutdown_tx.clone();
                             let cfg_json = config_json.clone();
+                            let registry = pid_registry.clone();
 
                             tokio::select! {
                                 res = server.connect() => {
                                     if res.is_ok() {
-                                        tokio::spawn(handle_client_connection(server, s_tx, cfg_json));
+                                        tokio::spawn(handle_client_connection(server, s_tx, cfg_json, registry));
                                     }
                                 }
                                 _ = shutdown_rx_ipc.changed() => {
@@ -147,6 +160,7 @@ async fn handle_client_connection(
     mut stream: NamedPipeServer,
     shutdown_tx: watch::Sender<bool>,
     config_json: String,
+    pid_registry: process_supervisor::SupervisedPidRegistry,
 ) {
     loop {
         let req_res: Result<RequestEnvelope> = transport::read_framed_message(&mut stream).await;
@@ -166,11 +180,29 @@ async fn handle_client_connection(
                 ref client_name,
             } => {
                 let client_pid = platform_windows::get_pipe_client_pid(&stream).unwrap_or(0);
+                if !pid_registry.is_authorized(client_pid) {
+                    tracing::warn!(
+                        client = %client_name,
+                        client_pid,
+                        "Mutual authentication failed: PID {} is not registered as a supervised child",
+                        client_pid
+                    );
+                    let resp_envelope = ResponseEnvelope {
+                        request_id: req.request_id,
+                        response: IpcResponse::Error(format!(
+                            "Mutual authentication failed: PID {} is not a supervised child process",
+                            client_pid
+                        )),
+                    };
+                    let _ = transport::write_framed_message(&mut stream, &resp_envelope).await;
+                    break;
+                }
+
                 tracing::info!(
                     client = %client_name,
                     client_version,
                     client_pid,
-                    "IPC Client authenticated and connected"
+                    "IPC Client authenticated against supervised registry and connected"
                 );
                 IpcResponse::HandshakeAck {
                     negotiated_version: PROTOCOL_VERSION_1,
@@ -234,6 +266,7 @@ mod tests {
     #[tokio::test]
     async fn test_shell_host_ipc_lifecycle() {
         let mut daemon = ShellHostDaemon::new().expect("Failed to initialize daemon");
+        daemon.authorize_pid(std::process::id());
         let pipe_addr = daemon.pipe_address().to_string();
 
         let daemon_task = tokio::spawn(async move {
@@ -319,5 +352,65 @@ mod tests {
         // Wait for daemon task to exit cleanly
         let daemon_res = daemon_task.await;
         assert!(daemon_res.is_ok(), "Daemon task must exit cleanly");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_shell_host_rejects_unauthorized_client_pid() {
+        let test_pipe = format!(r"\\.\pipe\astershell-test-unauth-{}", std::process::id());
+        let mut daemon =
+            ShellHostDaemon::new_with_pipe(&test_pipe).expect("Failed to initialize daemon");
+        // Explicitly authorize a different PID so that std::process::id() is rejected
+        daemon.authorize_pid(999999);
+        let pipe_addr = daemon.pipe_address().to_string();
+
+        let daemon_task = tokio::spawn(async move {
+            let _ = daemon.run().await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let mut client = transport::connect_pipe_client(&pipe_addr)
+            .await
+            .expect("Client failed to connect to daemon pipe");
+
+        // Handshake from unauthorized client
+        let req = RequestEnvelope {
+            request_id: 1,
+            request: IpcRequest::Handshake {
+                client_version: PROTOCOL_VERSION_1,
+                client_name: "unauthorized-rogue-client".into(),
+            },
+        };
+        transport::write_framed_message(&mut client, &req)
+            .await
+            .unwrap();
+
+        let resp: ResponseEnvelope = transport::read_framed_message(&mut client).await.unwrap();
+        assert_eq!(resp.request_id, 1);
+        match resp.response {
+            IpcResponse::Error(msg) => {
+                assert!(
+                    msg.contains("Mutual authentication failed"),
+                    "Expected mutual authentication failure message, got: {}",
+                    msg
+                );
+            }
+            other => panic!(
+                "Expected IpcResponse::Error for unauthorized client, got {:?}",
+                other
+            ),
+        }
+
+        // Verify that server closes the pipe after rejecting
+        let read_after: Result<ResponseEnvelope> =
+            transport::read_framed_message(&mut client).await;
+        assert!(
+            read_after.is_err(),
+            "Pipe stream should be disconnected by server"
+        );
+
+        // Clean up daemon
+        daemon_task.abort();
     }
 }
