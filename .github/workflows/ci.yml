@@ -44,4 +44,7 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Gate 4 — Workspace Test Suite (cargo test)
-        run: cargo test --workspace --locked --verbose
+        run: |
+          Set-Service -Name WSearch -StartupType Automatic -ErrorAction SilentlyContinue
+          Start-Service -Name WSearch -ErrorAction SilentlyContinue
+          cargo test --workspace --locked --verbose
