@@ -130,6 +130,21 @@ In alignment with Audit Observation INFO-01:
 
 ---
 
-## 5. Milestone 3 Authorization
+## 5. GitHub Publication & Repository Release Metadata
+
+In compliance with Milestone 2.1 release specifications, AsterShell has been published to GitHub under the user's account following complete verification:
+
+- **GitHub Repository URL:** `https://github.com/medhansh5/AsterShell`
+- **Repository Visibility:** Public
+- **Published Branch:** `master`
+- **Published Commit Hash:** `018a2a3261a1c8a7600a189c3573aac1b36edf1f`
+- **Repository Description:** `A native Rust-powered Windows 11 shell companion, featuring a Spotlight-style launcher, fast hybrid search, custom desktop experiences, and a modular architecture built for performance and extensibility.`
+- **Remote Verification Result:** Verified. GitHub API (`gh api repos/medhansh5/AsterShell/commits/master`) and `git ls-remote origin` confirm that remote `HEAD` and `refs/heads/master` point to `018a2a3261a1c8a7600a189c3573aac1b36edf1f` with clean working tree.
+- **Secret & Hygiene Scan Result:** Passed (0 findings). Dedicated regex scanner executed against all tracked files; zero API keys, GitHub tokens, passwords, private keys, or credentials detected. `.gitignore` comprehensively excludes build artifacts (`/target/`), binaries (`*.exe`, `*.pdb`), logs (`*.log`), and IDE state (`.vscode/`, `.idea/`).
+- **License Status:** The repository currently has no license.
+
+---
+
+## 6. Milestone 3 Authorization
 
 With all audit conditions (SEC-01, UI-01, LAUNCH-01, MEM-01, WIN-01, and DOC-01) resolved and verified by automated tests, AsterShell Milestone 2 is officially stabilized. The project is cleared to begin **Milestone 3 — Custom Taskbar & System Tray Integration**.
