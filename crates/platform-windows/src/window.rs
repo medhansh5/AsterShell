@@ -9,6 +9,9 @@ pub const WS_POPUP_FLAG: u32 = 0x8000_0000;
 pub const WS_VISIBLE_FLAG: u32 = 0x1000_0000;
 pub const WS_CLIPSIBLINGS_FLAG: u32 = 0x0400_0000;
 pub const WS_CLIPCHILDREN_FLAG: u32 = 0x0200_0000;
+pub const WS_CAPTION_FLAG: u32 = 0x00C0_0000;
+pub const WS_THICKFRAME_FLAG: u32 = 0x0004_0000;
+pub const WS_SYSMENU_FLAG: u32 = 0x0008_0000;
 pub const WS_EX_TOPMOST_FLAG: u32 = 0x0000_0008;
 pub const WS_EX_TOOLWINDOW_FLAG: u32 = 0x0000_0080;
 pub const WS_EX_NOACTIVATE_FLAG: u32 = 0x0800_0000;
@@ -411,9 +414,10 @@ pub fn configure_taskbar_native_styles(hwnd: isize) -> Result<(u32, u32)> {
         use windows::Win32::Foundation::HWND;
         use windows::Win32::UI::WindowsAndMessaging::{
             GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE, GWL_STYLE,
-            HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+            HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WS_CAPTION,
             WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-            WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+            WS_EX_TOPMOST, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
+            WS_VISIBLE,
         };
 
         let handle = HWND(hwnd as _);
@@ -422,9 +426,13 @@ pub fn configure_taskbar_native_styles(hwnd: isize) -> Result<(u32, u32)> {
         let current_style = unsafe { GetWindowLongPtrW(handle, GWL_STYLE) } as u32;
         let current_ex_style = unsafe { GetWindowLongPtrW(handle, GWL_EXSTYLE) } as u32;
 
-        // 2. Compute target base style: ensure POPUP, VISIBLE, CLIPSIBLINGS, CLIPCHILDREN are set
+        // 2. Compute target base style: ensure POPUP, VISIBLE, CLIPSIBLINGS, CLIPCHILDREN are set,
+        // and explicitly strip title-bar, resize-borders, and sysmenu frames (WINDOW-01).
+        let unwanted_frame_bits =
+            WS_CAPTION.0 | WS_THICKFRAME.0 | WS_MINIMIZEBOX.0 | WS_MAXIMIZEBOX.0 | WS_SYSMENU.0;
         let target_style =
-            current_style | WS_POPUP.0 | WS_VISIBLE.0 | WS_CLIPSIBLINGS.0 | WS_CLIPCHILDREN.0;
+            (current_style | WS_POPUP.0 | WS_VISIBLE.0 | WS_CLIPSIBLINGS.0 | WS_CLIPCHILDREN.0)
+                & !unwanted_frame_bits;
 
         // 3. Compute target extended style: add TOPMOST, TOOLWINDOW, NOACTIVATE; strip APPWINDOW
         let target_ex_style =
@@ -439,6 +447,8 @@ pub fn configure_taskbar_native_styles(hwnd: isize) -> Result<(u32, u32)> {
 
         // 5. Force frame update and HWND_TOPMOST without moving or stealing focus
         unsafe {
+            use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOWNA};
+            let _ = ShowWindow(handle, SW_SHOWNA);
             let _ = SetWindowPos(
                 handle,
                 HWND_TOPMOST,
@@ -540,4 +550,25 @@ pub fn position_taskbar_window(hwnd: isize, x: i32, y: i32, width: i32, height: 
     }
 
     Ok(())
+}
+
+/// Applies native Win32 window styles, DWM Mica backdrop, and primary-monitor positioning.
+pub fn apply_native_taskbar_configuration(hwnd: isize) -> Result<(u32, u32)> {
+    // 1. DWM Immersive Dark Mode and Mica backdrop with fallback
+    if let Err(e) = apply_dark_mode_and_backdrop(hwnd, DwmBackdropType::Mica) {
+        tracing::warn!(error = %e, "DWM Mica application returned fallback");
+    }
+
+    // 2. Configure native styles: WS_POPUP, WS_EX_TOPMOST, WS_EX_TOOLWINDOW, WS_EX_NOACTIVATE, !WS_EX_APPWINDOW
+    let (style, ex_style) = configure_taskbar_native_styles(hwnd)?;
+
+    // 3. Query DPI and calculate centered top coordinates on primary monitor
+    let dpi = get_window_dpi(hwnd);
+    if let Ok((x, y, phys_w, phys_h)) = calculate_taskbar_coordinates_with_dpi(720, 48, dpi) {
+        if let Err(e) = position_taskbar_window(hwnd, x, y, phys_w, phys_h) {
+            tracing::warn!(error = %e, "Failed to position taskbar window");
+        }
+    }
+
+    Ok((style, ex_style))
 }

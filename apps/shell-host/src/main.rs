@@ -74,6 +74,19 @@ impl ShellHostDaemon {
         self.supervisor.spawn(id)
     }
 
+    pub fn register_default_components(&mut self) {
+        if self.config.taskbar.enabled {
+            let taskbar_exe = resolve_component_executable(ComponentId::Taskbar);
+            let spec = process_supervisor::ProcessSpec {
+                id: ComponentId::Taskbar,
+                executable: taskbar_exe,
+                args: vec![],
+                restart_policy: self.config.supervisor.restart_policy.clone(),
+            };
+            self.supervisor.register(spec);
+        }
+    }
+
     pub async fn run(&mut self) -> Result<()> {
         self.is_running.store(true, Ordering::SeqCst);
         tracing::info!(
@@ -81,6 +94,21 @@ impl ShellHostDaemon {
             companion_mode = self.config.general.companion_mode,
             "AsterShell Shell Host supervisor daemon starting..."
         );
+
+        // Register default configured components (INTEGRATION-01)
+        self.register_default_components();
+
+        // Automatically spawn enabled components
+        if self.config.taskbar.enabled {
+            match self.supervisor.spawn(ComponentId::Taskbar) {
+                Ok(pid) => {
+                    tracing::info!(pid, "Supervised taskbar companion spawned successfully");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Taskbar companion auto-start skipped (executable unavailable or headless)");
+                }
+            }
+        }
 
         let shutdown_tx = self.shutdown_tx.clone();
         let mut shutdown_rx_ipc = self.shutdown_rx.clone();
@@ -280,6 +308,33 @@ async fn handle_client_connection(
             break;
         }
     }
+}
+
+/// Resolves the filesystem path to a workspace component executable.
+pub fn resolve_component_executable(component: ComponentId) -> std::path::PathBuf {
+    let exe_name = if cfg!(windows) {
+        format!("{}.exe", component.as_str())
+    } else {
+        component.as_str().to_string()
+    };
+
+    if let Ok(mut current) = std::env::current_exe() {
+        current.pop();
+        let target = current.join(&exe_name);
+        if target.exists() {
+            return target;
+        }
+        // In cargo test or target/debug/deps, target may be in parent directory
+        let parent_target = current.join("..").join(&exe_name);
+        if parent_target.exists() {
+            if let Ok(canon) = parent_target.canonicalize() {
+                return canon;
+            }
+            return parent_target;
+        }
+    }
+
+    std::path::PathBuf::from(exe_name)
 }
 
 #[tokio::main]
@@ -722,5 +777,39 @@ mod tests {
         );
 
         daemon_task.abort();
+    }
+
+    #[test]
+    fn test_resolve_component_executable() {
+        let path = resolve_component_executable(ComponentId::Taskbar);
+        assert!(path.to_string_lossy().contains("taskbar"));
+    }
+
+    #[test]
+    fn test_taskbar_registration_enabled() {
+        let mut daemon = ShellHostDaemon::new().expect("ShellHostDaemon::new");
+        assert!(daemon.config().taskbar.enabled);
+        daemon.register_default_components();
+        assert!(
+            daemon.supervisor().status(ComponentId::Taskbar).is_some(),
+            "Taskbar must be registered when enabled in config"
+        );
+    }
+
+    #[test]
+    fn test_taskbar_registration_disabled() {
+        let mut daemon = ShellHostDaemon::new().expect("ShellHostDaemon::new");
+        daemon.config = configuration::Config {
+            taskbar: configuration::TaskbarConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..daemon.config().clone()
+        };
+        daemon.register_default_components();
+        assert!(
+            daemon.supervisor().status(ComponentId::Taskbar).is_none(),
+            "Taskbar must NOT be registered when disabled in config"
+        );
     }
 }

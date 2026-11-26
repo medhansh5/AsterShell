@@ -4,19 +4,12 @@
 //! Supervised floating companion window built with Slint and Win32 APIs,
 //! supporting non-activating topmost presentation, DWM Mica composition,
 //! signed physical placement at the top of the primary monitor, zero work-area
-//! contraction, and dual IPC lifecycle coordination.
+//! contraction, and authenticated supervisor IPC lifecycle coordination.
 
 use astercore::{ComponentId, Result};
 use diagnostics::{init_diagnostics, DiagnosticConfig};
-use ipc::{
-    transport::{self, NamedPipeServer},
-    IpcRequest, IpcResponse, RequestEnvelope, ResponseEnvelope, PROTOCOL_VERSION_1,
-};
-use platform_windows::{
-    apply_dark_mode_and_backdrop, calculate_taskbar_coordinates_with_dpi,
-    configure_taskbar_native_styles, default_pipe_address, get_window_dpi, position_taskbar_window,
-    taskbar_pipe_address, DwmBackdropType,
-};
+use ipc::{transport, IpcRequest, RequestEnvelope, ResponseEnvelope, PROTOCOL_VERSION_1};
+use platform_windows::{apply_native_taskbar_configuration, default_pipe_address};
 use slint::ComponentHandle;
 use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -123,7 +116,7 @@ slint::slint! {
 }
 
 /// Applies native Win32 window styles, DWM Mica backdrop, and primary-monitor positioning.
-pub fn apply_native_taskbar_configuration(win: &TaskbarWindow) -> Option<isize> {
+pub fn apply_taskbar_native_styles(win: &TaskbarWindow) -> Option<isize> {
     use slint::winit_030::winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use slint::winit_030::WinitWindowAccessor;
 
@@ -139,86 +132,12 @@ pub fn apply_native_taskbar_configuration(win: &TaskbarWindow) -> Option<isize> 
         .flatten();
 
     if let Some(hwnd) = hwnd_opt {
-        // 1. DWM Immersive Dark Mode and Mica backdrop with fallback
-        if let Err(e) = apply_dark_mode_and_backdrop(hwnd, DwmBackdropType::Mica) {
-            tracing::warn!(error = %e, "DWM Mica application returned fallback");
-        }
-
-        // 2. Configure native styles: WS_POPUP, WS_EX_TOPMOST, WS_EX_TOOLWINDOW, WS_EX_NOACTIVATE, !WS_EX_APPWINDOW
-        if let Err(e) = configure_taskbar_native_styles(hwnd) {
-            tracing::warn!(error = %e, "Native taskbar styles configuration failed");
-        }
-
-        // 3. Query DPI and calculate centered top coordinates on primary monitor
-        let dpi = get_window_dpi(hwnd);
-        if let Ok((x, y, phys_w, phys_h)) = calculate_taskbar_coordinates_with_dpi(720, 48, dpi) {
-            if let Err(e) = position_taskbar_window(hwnd, x, y, phys_w, phys_h) {
-                tracing::warn!(error = %e, "Failed to position taskbar window");
-            }
+        if let Err(e) = apply_native_taskbar_configuration(hwnd) {
+            tracing::warn!(error = %e, "Failed to apply native taskbar configuration");
         }
     }
 
     hwnd_opt
-}
-
-/// Handles incoming IPC control requests from supervisor or test runner on the taskbar control pipe.
-#[cfg(windows)]
-async fn handle_taskbar_control_connection(
-    mut stream: NamedPipeServer,
-    is_running: Arc<AtomicBool>,
-) {
-    loop {
-        let req_res: Result<RequestEnvelope> = transport::read_framed_message(&mut stream).await;
-        let req = match req_res {
-            Ok(r) => r,
-            Err(_) => break,
-        };
-
-        let is_shutdown = matches!(req.request, IpcRequest::Shutdown);
-
-        let response = match req.request {
-            IpcRequest::Handshake {
-                client_version,
-                client_name,
-            } => {
-                tracing::info!(
-                    client = %client_name,
-                    client_version,
-                    "Taskbar control connection received handshake"
-                );
-                IpcResponse::HandshakeAck {
-                    negotiated_version: PROTOCOL_VERSION_1,
-                    server_pid: std::process::id(),
-                }
-            }
-            IpcRequest::Ping { timestamp_ms } => IpcResponse::Pong { timestamp_ms },
-            IpcRequest::Shutdown => {
-                tracing::info!("Received Shutdown command on taskbar control pipe");
-                is_running.store(false, Ordering::SeqCst);
-                let _ = slint::invoke_from_event_loop(|| {
-                    let _ = slint::quit_event_loop();
-                });
-                IpcResponse::Ack
-            }
-            _ => IpcResponse::Error("Unsupported operation on taskbar control pipe".into()),
-        };
-
-        let resp_envelope = ResponseEnvelope {
-            request_id: req.request_id,
-            response,
-        };
-
-        if transport::write_framed_message(&mut stream, &resp_envelope)
-            .await
-            .is_err()
-        {
-            break;
-        }
-
-        if is_shutdown {
-            break;
-        }
-    }
 }
 
 #[tokio::main]
@@ -231,17 +150,13 @@ async fn main() -> Result<()> {
     tracing::info!("AsterShell Taskbar (M3A Foundation) initializing...");
 
     let args: Vec<String> = env::args().collect();
-    let mut control_pipe = taskbar_pipe_address();
     let mut supervisor_pipe = default_pipe_address();
     let mut connect_supervisor = true;
+    let mut is_test_child = false;
 
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--pipe" if i + 1 < args.len() => {
-                control_pipe = args[i + 1].clone();
-                i += 1;
-            }
             "--supervisor-pipe" if i + 1 < args.len() => {
                 supervisor_pipe = args[i + 1].clone();
                 i += 1;
@@ -249,54 +164,62 @@ async fn main() -> Result<()> {
             "--no-supervisor" => {
                 connect_supervisor = false;
             }
+            "--test-child" => {
+                is_test_child = true;
+            }
             _ => {}
         }
         i += 1;
     }
 
-    let is_running = Arc::new(AtomicBool::new(true));
-
-    // 1. Spawn IPC Control Pipe Server
-    {
-        let is_running_ctrl = is_running.clone();
-        let pipe_addr = control_pipe.clone();
-        tokio::spawn(async move {
-            let mut is_first = true;
-            while is_running_ctrl.load(Ordering::SeqCst) {
-                #[cfg(windows)]
+    // In test-child mode, connect to supervisor IPC, acknowledge handshake, and wait for shutdown/pipe break
+    if is_test_child {
+        tracing::info!(supervisor_pipe = %supervisor_pipe, "Running in test-child mode: monitoring supervisor lifecycle");
+        if connect_supervisor {
+            if let Ok(mut client) = transport::connect_pipe_client(&supervisor_pipe).await {
+                let req = RequestEnvelope {
+                    request_id: 1,
+                    request: IpcRequest::Handshake {
+                        client_version: PROTOCOL_VERSION_1,
+                        client_name: "taskbar-test-child".to_string(),
+                    },
+                };
+                if transport::write_framed_message(&mut client, &req)
+                    .await
+                    .is_ok()
                 {
-                    let mut pipe_sec =
-                        platform_windows::default_pipe_sddl().ok().and_then(|sddl| {
-                            platform_windows::PipeSecurityDescriptor::from_sddl(&sddl).ok()
-                        });
-                    let sa_ptr = pipe_sec.as_mut().map(|s| s.as_raw_mut_ptr());
-
-                    match transport::create_pipe_server_with_security(&pipe_addr, is_first, sa_ptr)
-                    {
-                        Ok(server) => {
-                            is_first = false;
-                            let running = is_running_ctrl.clone();
-                            if server.connect().await.is_ok() {
-                                tokio::spawn(handle_taskbar_control_connection(server, running));
+                    let resp_res: Result<ResponseEnvelope> =
+                        transport::read_framed_message(&mut client).await;
+                    if let Ok(resp) = resp_res {
+                        tracing::info!(response = ?resp.response, "Test-child handshake acknowledged");
+                        loop {
+                            let incoming: Result<RequestEnvelope> =
+                                transport::read_framed_message(&mut client).await;
+                            match incoming {
+                                Ok(env) if matches!(env.request, IpcRequest::Shutdown) => {
+                                    tracing::info!("Test-child received Shutdown request via pipe");
+                                    break;
+                                }
+                                Err(_) => {
+                                    tracing::info!("Supervisor pipe closed; test-child exiting");
+                                    break;
+                                }
+                                _ => {}
                             }
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "Failed to create taskbar control pipe instance");
-                            tokio::time::sleep(Duration::from_millis(100)).await;
                         }
                     }
                 }
-
-                #[cfg(not(windows))]
-                {
-                    let _ = pipe_addr;
-                    break;
-                }
+            } else {
+                tracing::warn!("Test-child failed to connect to supervisor pipe");
             }
-        });
+        }
+        tracing::info!("AsterShell Taskbar test-child exited cleanly.");
+        return Ok(());
     }
 
-    // 2. Connect to ShellHost Supervisor via Named Pipe (AC-M3A-01)
+    let is_running = Arc::new(AtomicBool::new(true));
+
+    // 1. Connect to ShellHost Supervisor via Named Pipe (AC-M3A-01)
     if connect_supervisor {
         let is_running_sup = is_running.clone();
         let sup_addr = supervisor_pipe.clone();
@@ -369,7 +292,7 @@ async fn main() -> Result<()> {
         });
     }
 
-    // 3. Handle Ctrl+C signal
+    // 2. Handle Ctrl+C signal
     {
         let is_running_ctrl = is_running.clone();
         tokio::spawn(async move {
@@ -383,7 +306,7 @@ async fn main() -> Result<()> {
         });
     }
 
-    // 4. Instantiate and configure Slint Window
+    // 3. Instantiate and configure Slint Window
     let main_window = TaskbarWindow::new().map_err(|e| {
         astercore::AsterError::Platform(format!("Failed to create TaskbarWindow: {}", e))
     })?;
@@ -393,7 +316,7 @@ async fn main() -> Result<()> {
     })?;
 
     // Initial native Win32 configuration
-    apply_native_taskbar_configuration(&main_window);
+    apply_taskbar_native_styles(&main_window);
 
     // Re-verify styles and placement on short timer once Winit message pump starts
     let win_weak = main_window.as_weak();
@@ -403,7 +326,7 @@ async fn main() -> Result<()> {
         Duration::from_millis(50),
         move || {
             if let Some(win) = win_weak.upgrade() {
-                apply_native_taskbar_configuration(&win);
+                apply_taskbar_native_styles(&win);
             }
         },
     );
@@ -423,11 +346,5 @@ mod tests {
     #[test]
     fn test_taskbar_initialization() {
         assert_eq!(ComponentId::Taskbar.as_str(), "taskbar");
-    }
-
-    #[test]
-    fn test_taskbar_pipe_address_format() {
-        let pipe = taskbar_pipe_address();
-        assert!(pipe.starts_with(r"\\.\pipe\astershell-taskbar-"));
     }
 }

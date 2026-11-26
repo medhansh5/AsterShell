@@ -5,13 +5,14 @@ pub mod window;
 
 pub use hotkey::{register_global_hotkey, GlobalHotkeyHandle, HotkeyConfig, HotkeyError};
 pub use window::{
-    apply_dark_mode_and_backdrop, calculate_spotlight_coordinates,
-    calculate_spotlight_coordinates_with_dpi, calculate_taskbar_coordinates_with_dpi,
-    configure_taskbar_native_styles, get_active_monitor_work_area, get_primary_monitor_work_area,
-    get_window_dpi, get_window_styles, position_taskbar_window, position_window,
-    scale_to_physical_pixels, DwmBackdropType, Rect, WS_CLIPCHILDREN_FLAG, WS_CLIPSIBLINGS_FLAG,
-    WS_EX_APPWINDOW_FLAG, WS_EX_NOACTIVATE_FLAG, WS_EX_TOOLWINDOW_FLAG, WS_EX_TOPMOST_FLAG,
-    WS_POPUP_FLAG, WS_VISIBLE_FLAG,
+    apply_dark_mode_and_backdrop, apply_native_taskbar_configuration,
+    calculate_spotlight_coordinates, calculate_spotlight_coordinates_with_dpi,
+    calculate_taskbar_coordinates_with_dpi, configure_taskbar_native_styles,
+    get_active_monitor_work_area, get_primary_monitor_work_area, get_window_dpi, get_window_styles,
+    position_taskbar_window, position_window, scale_to_physical_pixels, DwmBackdropType, Rect,
+    WS_CAPTION_FLAG, WS_CLIPCHILDREN_FLAG, WS_CLIPSIBLINGS_FLAG, WS_EX_APPWINDOW_FLAG,
+    WS_EX_NOACTIVATE_FLAG, WS_EX_TOOLWINDOW_FLAG, WS_EX_TOPMOST_FLAG, WS_POPUP_FLAG,
+    WS_SYSMENU_FLAG, WS_THICKFRAME_FLAG, WS_VISIBLE_FLAG,
 };
 
 use astercore::{AsterError, Result};
@@ -135,6 +136,38 @@ impl JobObject {
         Ok(())
     }
 
+    /// Checks whether the specified process is assigned to this Job Object using the Win32 `IsProcessInJob` API.
+    #[cfg(windows)]
+    pub fn is_process_in_job(&self, process_handle: HANDLE) -> Result<bool> {
+        use windows::Win32::Foundation::BOOL;
+        use windows::Win32::System::JobObjects::IsProcessInJob;
+
+        let mut in_job = BOOL(0);
+        // SAFETY: Calling IsProcessInJob with valid process and job handles.
+        let res = unsafe { IsProcessInJob(process_handle, self.handle, &mut in_job) };
+        if let Err(e) = res {
+            return Err(AsterError::Platform(format!(
+                "IsProcessInJob query failed for Job Object '{}': {}",
+                self.name, e
+            )));
+        }
+        Ok(in_job.as_bool())
+    }
+
+    /// Checks whether a process identified by raw handle pointer is assigned to this Job Object.
+    pub fn contains_process_handle(&self, raw_handle: *mut std::ffi::c_void) -> Result<bool> {
+        #[cfg(windows)]
+        {
+            use windows::Win32::Foundation::HANDLE;
+            self.is_process_in_job(HANDLE(raw_handle as _))
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = raw_handle;
+            Ok(true)
+        }
+    }
+
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -222,16 +255,6 @@ pub fn default_pipe_address() -> String {
         sid.bytes().fold(0u64, |acc, b| acc.wrapping_add(b as u64))
     );
     format!(r"\\.\pipe\astershell-ipc-{}", hash)
-}
-
-/// Builds the standard named pipe address for the taskbar control endpoint.
-pub fn taskbar_pipe_address() -> String {
-    let sid = get_current_user_sid().unwrap_or_else(|_| "default".into());
-    let hash = format!(
-        "{:x}",
-        sid.bytes().fold(0u64, |acc, b| acc.wrapping_add(b as u64))
-    );
-    format!(r"\\.\pipe\astershell-taskbar-{}", hash)
 }
 
 /// Generates the standard user-restricted Named Pipe SDDL string.

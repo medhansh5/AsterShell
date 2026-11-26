@@ -344,6 +344,22 @@ impl ProcessSupervisor {
     pub fn job_object(&self) -> &JobObject {
         &self.job_object
     }
+
+    /// Queries the OS via the Win32 `IsProcessInJob` API to verify whether the specified
+    /// managed child process is currently assigned to this supervisor's Windows Job Object.
+    pub fn is_child_in_job(&self, id: ComponentId) -> Result<bool> {
+        if let Some(managed) = self.processes.get(&id) {
+            if let Some(ref child) = managed.child {
+                #[cfg(windows)]
+                if let Some(raw_h) = child.raw_handle() {
+                    return self.job_object.contains_process_handle(raw_h as _);
+                }
+                #[cfg(not(windows))]
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
 }
 
 pub fn crate_name() -> &'static str {

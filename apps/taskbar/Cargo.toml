@@ -18,6 +18,7 @@ slint = { version = "1.19", features = ["backend-winit", "unstable-winit-030"] }
 
 [dev-dependencies]
 process-supervisor = { workspace = true }
+slint = { version = "1.19", features = ["backend-winit", "unstable-winit-030"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = [
