@@ -11,51 +11,64 @@
 
 ---
 
-## Milestone 1: IPC Core, Process Supervision & Hybrid Search Prototype (Next)
-**Objective:** Deliver the persistent supervisor daemon and a functional Spotlight-style search overlay.
-
-### Explicit Acceptance Criteria:
-1. **Supervisor Engine (`shell-host`, `process-supervisor`):**
-   - Win32 Job Object successfully created with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
-   - Child process crash detection implemented with exponential backoff and circuit breaker.
-   - Named Pipe server accepting connections at `\\.\pipe\astershell-ipc-{hash}` with SID DACL.
-2. **Versioned IPC Protocol (`ipc`):**
-   - Framing header (`"ASTS"` magic, version 1, payload length) verified with unit tests.
-   - Postcard binary serialization benchmarks showing roundtrip latency < 0.5 ms.
-3. **Application Catalog (`application-catalog`):**
-   - In-memory SQLite FTS5 database populating all 130+ applications from `shell:AppsFolder` in < 250 ms.
-   - Instant prefix and fuzzy match queries completing in < 5 ms.
-4. **Hybrid Search Engine (`search-core`, `search-providers`):**
-   - Parallel query fan-out with cancellation token on new keystroke.
-   - Connection pool to `Search.CollatorDSO` pre-warmed at startup.
-   - Integrated arithmetic evaluator returning math results in < 1 ms.
-5. **Search Overlay Prototype (`search-ui`):**
-   - Global hotkey `Alt + Space` registers and brings overlay into foreground in < 30 ms.
-   - Slint UI rendering results with keyboard navigation (Up, Down, Enter, Esc).
-   - End-to-end p95 warm query-to-render latency verified under 100 ms.
+## Milestone 1A: Core Infrastructure & Process Supervision (Completed)
+- [x] Windows Job Object integration (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`).
+- [x] Persistent `shell-host` daemon with child process supervisor.
+- [x] Versioned Named Pipe IPC bus (`\\.\pipe\astershell-ipc-{hash}`) with custom framing header (`ASTS`).
+- [x] Hierarchical configuration engine and structured diagnostics logging.
+- [x] Independent exit audit completed: `APPROVE M1B WITH CONDITIONS`.
 
 ---
 
-## Milestone 2: Taskbar, Window Tracking & DWM Thumbnails
-**Objective:** Deliver modern docked taskbar with real-time window tracking and live previews.
-
-### Acceptance Criteria:
-1. `window-tracker` registers asynchronous WinEvent hooks for window create, destroy, focus, and title change.
-2. `taskbar` registers as an official Windows AppBar (`SHAppBarMessage` `ABM_NEW`, `ABM_SETPOS`) without clipping maximized windows.
-3. DWM live thumbnail handles (`DwmRegisterThumbnail`) render smooth 60fps window hover cards.
-4. Proper multi-monitor display enumeration and per-monitor DPI scaling.
+## Milestone 1B: Search Infrastructure & Hybrid Indexing (Completed)
+- [x] In-memory SQLite FTS5 application index with prefix and fuzzy matching.
+- [x] Windows Search OLE DB provider (`Search.CollatorDSO`) with connection pooling and query sanitization.
+- [x] Integrated math evaluation provider.
+- [x] Unified parallel search orchestrator with cancellation tokens and scoring.
+- [x] Independent exit audit completed: `APPROVE M2 WITH CONDITIONS`.
 
 ---
 
-## Milestone 3: Start Menu & App Launcher
+## Milestone 2: Spotlight Interface (`search-ui`) (Completed)
+- [x] Slint hardware-accelerated search overlay with keyboard navigation.
+- [x] Global hotkey registration (`Alt + Space`) and foreground elevation.
+- [x] DWM Mica / Acrylic system backdrops and dark mode styling.
+- [x] Safe application activation abstraction (`shell-api`).
+- [x] Independent exit audit completed: `APPROVE M2.1 WITH CONDITIONS`.
+
+---
+
+## Milestone 2.1: Security & Correctness Remediation + GitHub Publication (Completed)
+- [x] SEC-01: Enforcement of strict mutual PID authentication in `shell-host` IPC listener.
+- [x] UI-01: Generation-aware search event delivery eliminating race conditions.
+- [x] LAUNCH-01: Packaged MSIX/UWP application launch via validated AUMID / `shell:AppsFolder`.
+- [x] Published to GitHub (`https://github.com/medhansh5/AsterShell`) with CI/CD passing on Windows runners.
+- [x] Independent post-publication audit completed: `APPROVE M3 ARCHITECTURE SPECIFICATION`.
+
+---
+
+## Milestone 3: Custom Taskbar & System Tray Integration (Current Stage — Architecture Approved)
+**Objective:** Deliver AsterShell's first custom, multi-monitor taskbar (`AsterTaskbar`) and persistent system tray subsystem (`AsterTray`) in companion mode.
+
+### Planned Sub-Stages:
+- [ ] **M3A: Native Taskbar Window Foundation & Lifecycle:** Slint window creation, `WS_POPUP`, `WS_EX_TOOLWINDOW`, `WS_EX_NOACTIVATE`, DWM Mica backdrops, supervisor binding.
+- [ ] **M3B: Monitor Topology, Dynamic DPI & Positioning:** `EnumDisplayMonitors`, per-monitor taskbar instances, `WM_DISPLAYCHANGE`, Per-Monitor V2 DPI scaling.
+- [ ] **M3C: Running Application Discovery & Activation:** `crates/window-tracker` STA WinEvent hook thread, 7-stage HWND filtering, foreground window switching.
+- [ ] **M3D: AsterShell-Owned System Tray Infrastructure:** `Shell_NotifyIconW` with `NOTIFYICON_VERSION_4` and GUID identity, `TaskbarCreated` recovery, Win32 context menu.
+- [ ] **M3E: Taskbar Interactions, Clock & System Indicators:** Floating island UI layout, minute-synced clock, zero-polling CoreAudio volume, Network List Manager, battery status.
+- [ ] **M3F: Integration, Performance, Reliability & Release Audit:** End-to-end stress tests, memory/CPU profiling, GitHub Actions CI verification, exit audit.
+
+---
+
+## Milestone 4: Start Menu & App Launcher (Future)
 **Objective:** Complete modern Start flyout with pinned grid, recent files, and categorized apps.
 
 ---
 
-## Milestone 4: Desktop Canvas & Workspace Management
+## Milestone 5: Desktop Canvas & Workspace Management (Future)
 **Objective:** Dedicated wallpaper canvas, desktop grid, and window tiling gestures.
 
 ---
 
-## Milestone 5: Full Shell Replacement & Recovery Watchdog
+## Milestone 6: Full Shell Replacement & Recovery Watchdog (Future)
 **Objective:** Safe per-user shell configuration (`HKCU\...\Winlogon\Shell`) with automated Explorer fallback.
