@@ -11,7 +11,7 @@ AsterShell maintains an open, welcoming, and harassment-free environment for all
 - Focus on technical merit, empirical data, code clarity, and system security.
 
 ## 3. Contributing Guidelines
-- All pull requests must compile cleanly on the latest stable Rust toolchain on Windows.
+- All pull requests must target the `main` branch and compile cleanly on the latest stable Rust toolchain on Windows.
 - Run `cargo fmt --check`, `cargo clippy --workspace --all-targets`, and `cargo test` prior to submitting code.
 - New architecture decisions must be accompanied by an ADR in `docs/decisions/`.
 - Unsafe Rust code must be strictly isolated to `platform-windows` or `crates/` FFI boundaries and documented with `// SAFETY:` invariant comments.

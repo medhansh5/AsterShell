@@ -88,11 +88,14 @@ AsterShell strictly adheres to a **Zero Shell Mutation Policy** during standard 
 ## 🗺️ Roadmap & Milestones
 
 - **Phase 0:** Architecture, Reverse Engineering & Project Establishment ✅
-- **Milestone 1:** IPC Foundation, Process Supervisor & Hybrid Search Core Prototype (In Progress)
-- **Milestone 2:** Taskbar, Window Tracker & DWM Live Thumbnails
-- **Milestone 3:** Start Menu & Unified Application Catalog
-- **Milestone 4:** Desktop Canvas & Multi-Monitor Workspace Management
-- **Milestone 5:** Optional Full Shell Replacement & Recovery Watchdog
+- **Milestone 1A:** Core Infrastructure & Process Supervision ✅
+- **Milestone 1B:** Search Infrastructure & Hybrid Indexing ✅
+- **Milestone 2:** Spotlight Interface (`search-ui`) ✅
+- **Milestone 2.1:** Security Remediation & Publication ✅
+- **Milestone 3:** Custom Taskbar & System Tray Integration (Architecture Approved)
+- **Milestone 4:** Start Menu & App Launcher
+- **Milestone 5:** Desktop Canvas & Workspace Management
+- **Milestone 6:** Full Shell Replacement & Recovery Watchdog
 
 See [ROADMAP.md](ROADMAP.md) for detailed milestone acceptance criteria.
 
