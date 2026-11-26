@@ -6,8 +6,12 @@ pub mod window;
 pub use hotkey::{register_global_hotkey, GlobalHotkeyHandle, HotkeyConfig, HotkeyError};
 pub use window::{
     apply_dark_mode_and_backdrop, calculate_spotlight_coordinates,
-    calculate_spotlight_coordinates_with_dpi, get_active_monitor_work_area, get_window_dpi,
-    position_window, scale_to_physical_pixels, DwmBackdropType, Rect,
+    calculate_spotlight_coordinates_with_dpi, calculate_taskbar_coordinates_with_dpi,
+    configure_taskbar_native_styles, get_active_monitor_work_area, get_primary_monitor_work_area,
+    get_window_dpi, get_window_styles, position_taskbar_window, position_window,
+    scale_to_physical_pixels, DwmBackdropType, Rect, WS_CLIPCHILDREN_FLAG, WS_CLIPSIBLINGS_FLAG,
+    WS_EX_APPWINDOW_FLAG, WS_EX_NOACTIVATE_FLAG, WS_EX_TOOLWINDOW_FLAG, WS_EX_TOPMOST_FLAG,
+    WS_POPUP_FLAG, WS_VISIBLE_FLAG,
 };
 
 use astercore::{AsterError, Result};
@@ -218,6 +222,16 @@ pub fn default_pipe_address() -> String {
         sid.bytes().fold(0u64, |acc, b| acc.wrapping_add(b as u64))
     );
     format!(r"\\.\pipe\astershell-ipc-{}", hash)
+}
+
+/// Builds the standard named pipe address for the taskbar control endpoint.
+pub fn taskbar_pipe_address() -> String {
+    let sid = get_current_user_sid().unwrap_or_else(|_| "default".into());
+    let hash = format!(
+        "{:x}",
+        sid.bytes().fold(0u64, |acc, b| acc.wrapping_add(b as u64))
+    );
+    format!(r"\\.\pipe\astershell-taskbar-{}", hash)
 }
 
 /// Generates the standard user-restricted Named Pipe SDDL string.
@@ -494,5 +508,67 @@ mod tests {
                 panic!("Unexpected error registering hotkey: {:?}", e);
             }
         }
+    }
+
+    #[test]
+    fn test_taskbar_style_flags() {
+        assert_eq!(WS_POPUP_FLAG, 0x8000_0000);
+        assert_eq!(WS_VISIBLE_FLAG, 0x1000_0000);
+        assert_eq!(WS_CLIPSIBLINGS_FLAG, 0x0400_0000);
+        assert_eq!(WS_CLIPCHILDREN_FLAG, 0x0200_0000);
+        assert_eq!(WS_EX_TOPMOST_FLAG, 0x0000_0008);
+        assert_eq!(WS_EX_TOOLWINDOW_FLAG, 0x0000_0080);
+        assert_eq!(WS_EX_NOACTIVATE_FLAG, 0x0800_0000);
+        assert_eq!(WS_EX_APPWINDOW_FLAG, 0x0004_0000);
+    }
+
+    #[test]
+    fn test_primary_monitor_work_area() {
+        let work_res = get_primary_monitor_work_area();
+        assert!(
+            work_res.is_ok(),
+            "Should retrieve primary monitor work area: {:?}",
+            work_res.err()
+        );
+        let work = work_res.unwrap();
+        assert!(work.width() > 0, "Work area width must be positive");
+        assert!(work.height() > 0, "Work area height must be positive");
+    }
+
+    #[test]
+    fn test_taskbar_coordinates_signed_math() {
+        // Test with real primary monitor
+        let coords_res = calculate_taskbar_coordinates_with_dpi(720, 48, 96);
+        assert!(coords_res.is_ok());
+        let (x, y, w, h) = coords_res.unwrap();
+        assert_eq!(w, 720);
+        assert_eq!(h, 48);
+        let work = get_primary_monitor_work_area().unwrap();
+        assert_eq!(y, work.top, "Taskbar Y must match work.top");
+        assert_eq!(
+            x,
+            work.left + (work.width() - 720) / 2,
+            "Taskbar X must be horizontally centered"
+        );
+
+        // Test DPI scaling (150% = 144 DPI)
+        let coords_144 = calculate_taskbar_coordinates_with_dpi(720, 48, 144).unwrap();
+        assert_eq!(coords_144.2, 1080); // 720 * 144 / 96 = 1080
+        assert_eq!(coords_144.3, 72); // 48 * 144 / 96 = 72
+
+        // Verify signed negative coordinate math manually
+        let negative_work = Rect {
+            left: -1920,
+            top: -1080,
+            right: 0,
+            bottom: 0,
+        };
+        assert_eq!(negative_work.width(), 1920);
+        assert_eq!(negative_work.height(), 1080);
+        let phys_w = scale_to_physical_pixels(720, 96);
+        let calc_x = negative_work.left + (negative_work.width() - phys_w) / 2;
+        let calc_y = negative_work.top;
+        assert_eq!(calc_x, -1920 + (1920 - 720) / 2); // -1320
+        assert_eq!(calc_y, -1080);
     }
 }

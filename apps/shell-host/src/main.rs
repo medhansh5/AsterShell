@@ -58,8 +58,20 @@ impl ShellHostDaemon {
         self.supervisor.pid_registry().authorize(pid);
     }
 
+    pub fn supervisor(&self) -> &ProcessSupervisor {
+        &self.supervisor
+    }
+
     pub fn supervisor_mut(&mut self) -> &mut ProcessSupervisor {
         &mut self.supervisor
+    }
+
+    pub fn register_component(&mut self, spec: process_supervisor::ProcessSpec) {
+        self.supervisor.register(spec);
+    }
+
+    pub fn spawn_component(&mut self, id: ComponentId) -> Result<u32> {
+        self.supervisor.spawn(id)
     }
 
     pub async fn run(&mut self) -> Result<()> {

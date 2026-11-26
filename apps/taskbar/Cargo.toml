@@ -12,3 +12,19 @@ astercore = { workspace = true }
 diagnostics = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
+ipc = { workspace = true }
+platform-windows = { workspace = true }
+slint = { version = "1.19", features = ["backend-winit", "unstable-winit-030"] }
+
+[dev-dependencies]
+process-supervisor = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_HiDpi",
+    "Win32_System_Threading",
+] }
