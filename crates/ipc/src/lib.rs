@@ -93,6 +93,7 @@ pub enum IpcResponse {
     DiscoveredApps(Vec<DiscoveredApp>),
     Ack,
     ShutdownNotice,
+    ToggleTaskbarNotice,
     Error(String),
 }
 

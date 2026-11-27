@@ -25,10 +25,11 @@ pub use window::{
     calculate_spotlight_coordinates, calculate_spotlight_coordinates_with_dpi,
     calculate_taskbar_coordinates_with_dpi, configure_taskbar_native_styles,
     get_active_monitor_work_area, get_primary_monitor_work_area, get_window_dpi, get_window_styles,
-    position_taskbar_window, position_window, scale_to_physical_pixels, DwmBackdropType, Rect,
-    WS_CAPTION_FLAG, WS_CLIPCHILDREN_FLAG, WS_CLIPSIBLINGS_FLAG, WS_EX_APPWINDOW_FLAG,
-    WS_EX_NOACTIVATE_FLAG, WS_EX_TOOLWINDOW_FLAG, WS_EX_TOPMOST_FLAG, WS_POPUP_FLAG,
-    WS_SYSMENU_FLAG, WS_THICKFRAME_FLAG, WS_VISIBLE_FLAG,
+    position_taskbar_window, position_window, scale_to_physical_pixels,
+    show_window_item_context_menu, DwmBackdropType, Rect, WindowMenuAction, WS_CAPTION_FLAG,
+    WS_CLIPCHILDREN_FLAG, WS_CLIPSIBLINGS_FLAG, WS_EX_APPWINDOW_FLAG, WS_EX_NOACTIVATE_FLAG,
+    WS_EX_TOOLWINDOW_FLAG, WS_EX_TOPMOST_FLAG, WS_POPUP_FLAG, WS_SYSMENU_FLAG, WS_THICKFRAME_FLAG,
+    WS_VISIBLE_FLAG,
 };
 
 use astercore::{AsterError, Result};

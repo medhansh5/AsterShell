@@ -322,11 +322,36 @@ fn wire_taskbar_callbacks(
 
     {
         let table_rclick = hwnd_table.clone();
+        let win_weak_rclick = win.as_weak();
         win.on_item_right_clicked(move |item_id, title| {
-            let hwnd_opt = table_rclick.lock().ok().and_then(|t| t.resolve(item_id));
-            if let Some(hwnd) = hwnd_opt {
-                tracing::info!(hwnd, title = %title, "Closing tracked window via taskbar right-click");
-                let _ = window_tracker::close_window(hwnd);
+            let Some(target_hwnd) = table_rclick.lock().ok().and_then(|t| t.resolve(item_id))
+            else {
+                return;
+            };
+            let owner_hwnd = win_weak_rclick
+                .upgrade()
+                .and_then(|w| extract_win32_hwnd(&w))
+                .unwrap_or(0);
+
+            match platform_windows::show_window_item_context_menu(owner_hwnd) {
+                Ok(platform_windows::WindowMenuAction::Activate) => {
+                    let _ = window_tracker::activate_window(target_hwnd);
+                }
+                Ok(platform_windows::WindowMenuAction::Minimize) => {
+                    let _ = window_tracker::minimize_window(target_hwnd);
+                }
+                Ok(platform_windows::WindowMenuAction::Close) => {
+                    tracing::info!(
+                        target_hwnd,
+                        title = %title,
+                        "Closing tracked window via taskbar context menu"
+                    );
+                    let _ = window_tracker::close_window(target_hwnd);
+                }
+                Ok(platform_windows::WindowMenuAction::None) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to show taskbar item context menu");
+                }
             }
         });
     }
@@ -372,11 +397,38 @@ fn launch_app_target(target: &str) {
     }
 }
 
+/// Extracts the Win32 `HWND` (`isize`) from a Slint `TaskbarWindow`.
+fn extract_win32_hwnd(win: &TaskbarWindow) -> Option<isize> {
+    use slint::winit_030::winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use slint::winit_030::WinitWindowAccessor;
+
+    win.window()
+        .with_winit_window(|winit_window| match winit_window.window_handle() {
+            Ok(handle) => match handle.as_raw() {
+                RawWindowHandle::Win32(win32) => Some(win32.hwnd.get()),
+                _ => None,
+            },
+            Err(_) => None,
+        })
+        .flatten()
+}
+
 /// Manages the supervisor connection lifecycle with bounded exponential backoff retry and reconnection.
 pub async fn run_supervisor_connection_loop(
     pipe_address: String,
     is_running: Arc<AtomicBool>,
     shutdown_notify: Arc<tokio::sync::Notify>,
+) {
+    run_supervisor_connection_loop_with_toggle(pipe_address, is_running, shutdown_notify, None)
+        .await;
+}
+
+/// Manages the supervisor connection lifecycle and dispatches supervisor `ToggleTaskbarNotice` events.
+pub async fn run_supervisor_connection_loop_with_toggle(
+    pipe_address: String,
+    is_running: Arc<AtomicBool>,
+    shutdown_notify: Arc<tokio::sync::Notify>,
+    on_toggle_taskbar: Option<Arc<dyn Fn() + Send + Sync>>,
 ) {
     let mut attempt = 0u32;
     let initial_backoff = Duration::from_millis(100);
@@ -416,8 +468,8 @@ pub async fn run_supervisor_connection_loop(
                                     }
                                     incoming = transport::read_framed_message::<_, ResponseEnvelope>(&mut client) => {
                                         match incoming {
-                                            Ok(env) => {
-                                                if matches!(env.response, IpcResponse::ShutdownNotice) {
+                                            Ok(env) => match env.response {
+                                                IpcResponse::ShutdownNotice => {
                                                     tracing::info!("Supervisor sent ShutdownNotice; commencing graceful taskbar termination");
                                                     is_running.store(false, Ordering::SeqCst);
                                                     let _ = slint::invoke_from_event_loop(|| {
@@ -425,7 +477,14 @@ pub async fn run_supervisor_connection_loop(
                                                     });
                                                     return;
                                                 }
-                                            }
+                                                IpcResponse::ToggleTaskbarNotice => {
+                                                    tracing::info!("Supervisor sent ToggleTaskbarNotice; toggling taskbar visibility");
+                                                    if let Some(cb) = &on_toggle_taskbar {
+                                                        cb();
+                                                    }
+                                                }
+                                                _ => {}
+                                            },
                                             Err(e) => {
                                                 tracing::info!(error = %e, "Supervisor connection dropped; entering reconnection lifecycle");
                                                 break;
@@ -570,14 +629,42 @@ async fn main() -> Result<()> {
     }
 
     let is_running = Arc::new(AtomicBool::new(true));
+    let is_visible = Arc::new(AtomicBool::new(true));
     let shutdown_notify = Arc::new(tokio::sync::Notify::new());
+
+    let main_window = TaskbarWindow::new().map_err(|e| {
+        astercore::AsterError::Platform(format!("Failed to create TaskbarWindow: {}", e))
+    })?;
 
     if connect_supervisor {
         let is_running_sup = is_running.clone();
         let shutdown_notify_sup = shutdown_notify.clone();
         let sup_addr = supervisor_pipe.clone();
+        let win_weak_toggle = main_window.as_weak();
+        let is_visible_toggle = is_visible.clone();
+        let toggle_cb: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            let currently_visible = is_visible_toggle.load(Ordering::SeqCst);
+            let next_visible = !currently_visible;
+            is_visible_toggle.store(next_visible, Ordering::SeqCst);
+            let w_weak = win_weak_toggle.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(win) = w_weak.upgrade() {
+                    if next_visible {
+                        let _ = win.show();
+                    } else {
+                        let _ = win.hide();
+                    }
+                }
+            });
+        });
         tokio::spawn(async move {
-            run_supervisor_connection_loop(sup_addr, is_running_sup, shutdown_notify_sup).await;
+            run_supervisor_connection_loop_with_toggle(
+                sup_addr,
+                is_running_sup,
+                shutdown_notify_sup,
+                Some(toggle_cb),
+            )
+            .await;
         });
     }
 
@@ -595,10 +682,6 @@ async fn main() -> Result<()> {
             }
         });
     }
-
-    let main_window = TaskbarWindow::new().map_err(|e| {
-        astercore::AsterError::Platform(format!("Failed to create TaskbarWindow: {}", e))
-    })?;
 
     let hwnd_table = Arc::new(std::sync::Mutex::new(HwndHandleTable::new()));
     wire_taskbar_callbacks(&main_window, &hwnd_table);

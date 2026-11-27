@@ -108,8 +108,10 @@ impl ShellHostDaemon {
 
         // 1. Channel to deterministically signal when the IPC listener is bound and ready to accept connections
         let (listener_ready_tx, listener_ready_rx) = tokio::sync::oneshot::channel::<()>();
+        let (toggle_taskbar_tx, _) = watch::channel(0u64);
 
         // 2. Spawn IPC Named Pipe Listener
+        let toggle_for_ipc = toggle_taskbar_tx.clone();
         let ipc_task = tokio::spawn(async move {
             let mut is_first = true;
             let mut ready_sender = Some(listener_ready_tx);
@@ -134,13 +136,14 @@ impl ShellHostDaemon {
 
                             let s_tx = shutdown_tx.clone();
                             let s_rx = shutdown_rx_ipc.clone();
+                            let t_rx = toggle_for_ipc.subscribe();
                             let cfg_json = config_json.clone();
                             let registry = pid_registry.clone();
 
                             tokio::select! {
                                 res = server.connect() => {
                                     if res.is_ok() {
-                                        tokio::spawn(handle_client_connection(server, s_tx, s_rx, cfg_json, registry));
+                                        tokio::spawn(handle_client_connection(server, s_tx, s_rx, t_rx, cfg_json, registry));
                                     }
                                 }
                                 _ = shutdown_rx_ipc.changed() => {
@@ -194,22 +197,22 @@ impl ShellHostDaemon {
         let _tray_handle = match TrayIconHandle::start("AsterShell Companion") {
             Ok((handle, tray_rx)) => {
                 let shutdown_tx_tray = self.shutdown_tx.clone();
+                let toggle_tx_tray = toggle_taskbar_tx.clone();
                 std::thread::Builder::new()
                     .name("shell-host-tray-events".to_string())
                     .spawn(move || {
                         while let Ok(action) = tray_rx.recv() {
-                            match action {
-                                TrayAction::OpenSearch => {
-                                    tracing::info!("System tray action: OpenSearch");
-                                }
-                                TrayAction::ToggleTaskbar => {
-                                    tracing::info!("System tray action: ToggleTaskbar");
-                                }
-                                TrayAction::Exit => {
-                                    tracing::info!("System tray action: Exit AsterShell requested");
-                                    let _ = shutdown_tx_tray.send(true);
-                                    break;
-                                }
+                            let is_exit = matches!(action, TrayAction::Exit);
+                            if let Err(e) = dispatch_tray_action(
+                                action,
+                                &shutdown_tx_tray,
+                                &toggle_tx_tray,
+                                &launch_spotlight_search,
+                            ) {
+                                tracing::warn!(error = %e, "Tray action dispatch failed");
+                            }
+                            if is_exit {
+                                break;
                             }
                         }
                     })
@@ -252,11 +255,45 @@ impl ShellHostDaemon {
     }
 }
 
+fn launch_spotlight_search() -> Result<()> {
+    let exe = resolve_component_executable(ComponentId::SearchUi);
+    std::process::Command::new(&exe).spawn().map_err(|e| {
+        astercore::AsterError::Platform(format!("Failed to launch {}: {}", exe.display(), e))
+    })?;
+    Ok(())
+}
+
+pub fn dispatch_tray_action(
+    action: TrayAction,
+    shutdown_tx: &watch::Sender<bool>,
+    toggle_tx: &watch::Sender<u64>,
+    open_search_fn: &dyn Fn() -> Result<()>,
+) -> Result<()> {
+    match action {
+        TrayAction::OpenSearch => {
+            tracing::info!("System tray action: OpenSearch");
+            open_search_fn()
+        }
+        TrayAction::ToggleTaskbar => {
+            tracing::info!("System tray action: ToggleTaskbar");
+            let next = toggle_tx.borrow().wrapping_add(1);
+            let _ = toggle_tx.send(next);
+            Ok(())
+        }
+        TrayAction::Exit => {
+            tracing::info!("System tray action: Exit AsterShell requested");
+            let _ = shutdown_tx.send(true);
+            Ok(())
+        }
+    }
+}
+
 #[cfg(windows)]
 async fn handle_client_connection(
     mut stream: NamedPipeServer,
     shutdown_tx: watch::Sender<bool>,
     mut shutdown_rx: watch::Receiver<bool>,
+    mut toggle_rx: watch::Receiver<u64>,
     config_json: String,
     pid_registry: process_supervisor::SupervisedPidRegistry,
 ) {
@@ -277,6 +314,15 @@ async fn handle_client_connection(
                     };
                     let _ = transport::write_framed_message(&mut stream, &notice).await;
                     break;
+                }
+            }
+            _ = toggle_rx.changed() => {
+                if is_authenticated {
+                    let notice = ResponseEnvelope {
+                        request_id: 0,
+                        response: IpcResponse::ToggleTaskbarNotice,
+                    };
+                    let _ = transport::write_framed_message(&mut stream, &notice).await;
                 }
             }
             req_res = transport::read_framed_message::<_, RequestEnvelope>(&mut stream) => {
@@ -1042,5 +1088,42 @@ mod tests {
             daemon.supervisor().status(ComponentId::Taskbar).is_none(),
             "Taskbar must NOT be registered when disabled in config"
         );
+    }
+
+    #[test]
+    fn test_tray_action_dispatch_all_handlers() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (toggle_tx, toggle_rx) = watch::channel(0u64);
+        let search_count = std::sync::atomic::AtomicUsize::new(0);
+
+        dispatch_tray_action(TrayAction::OpenSearch, &shutdown_tx, &toggle_tx, &|| {
+            search_count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .expect("OpenSearch dispatch");
+        assert_eq!(search_count.load(Ordering::SeqCst), 1);
+        assert!(!*shutdown_rx.borrow(), "OpenSearch must not shut down host");
+
+        dispatch_tray_action(TrayAction::ToggleTaskbar, &shutdown_tx, &toggle_tx, &|| {
+            Ok(())
+        })
+        .expect("ToggleTaskbar dispatch");
+        assert_eq!(*toggle_rx.borrow(), 1);
+        assert!(
+            !*shutdown_rx.borrow(),
+            "ToggleTaskbar must not shut down host"
+        );
+
+        // Failing OpenSearch returns error cleanly without terminating host
+        let err_res =
+            dispatch_tray_action(TrayAction::OpenSearch, &shutdown_tx, &toggle_tx, &|| {
+                Err(astercore::AsterError::Platform("missing binary".into()))
+            });
+        assert!(err_res.is_err());
+        assert!(!*shutdown_rx.borrow());
+
+        dispatch_tray_action(TrayAction::Exit, &shutdown_tx, &toggle_tx, &|| Ok(()))
+            .expect("Exit dispatch");
+        assert!(*shutdown_rx.borrow(), "Exit must signal shutdown");
     }
 }
