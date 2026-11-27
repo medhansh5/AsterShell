@@ -171,6 +171,37 @@ impl JobObject {
     pub fn name(&self) -> &str {
         &self.name
     }
+
+    /// Queries the OS via the Win32 `QueryInformationJobObject` API to verify whether
+    /// the `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` flag is active on the kernel Job Object.
+    #[cfg(windows)]
+    pub fn query_kill_on_close(&self) -> Result<bool> {
+        use windows::Win32::System::JobObjects::{
+            JobObjectExtendedLimitInformation, QueryInformationJobObject,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+
+        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        let mut return_length = 0u32;
+        // SAFETY: Calling QueryInformationJobObject with valid job handle and correctly sized buffer.
+        let res = unsafe {
+            QueryInformationJobObject(
+                self.handle,
+                JobObjectExtendedLimitInformation,
+                &mut info as *mut _ as _,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                Some(&mut return_length),
+            )
+        };
+        res.map_err(|e| AsterError::Platform(format!("Failed to query Job Object limits: {}", e)))?;
+        let flags = info.BasicLimitInformation.LimitFlags;
+        Ok((flags.0 & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.0) != 0)
+    }
+
+    #[cfg(not(windows))]
+    pub fn query_kill_on_close(&self) -> Result<bool> {
+        Ok(true)
+    }
 }
 
 impl Drop for JobObject {
@@ -435,6 +466,13 @@ mod tests {
     fn test_job_object_lifecycle() {
         let job = JobObject::create("AsterShellTestJob").expect("Failed to create JobObject");
         assert_eq!(job.name(), "AsterShellTestJob");
+        let kill_on_close = job
+            .query_kill_on_close()
+            .expect("query_kill_on_close must succeed");
+        assert!(
+            kill_on_close,
+            "JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE must be active on created job object"
+        );
     }
 
     #[test]

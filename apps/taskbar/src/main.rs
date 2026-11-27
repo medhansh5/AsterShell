@@ -8,7 +8,9 @@
 
 use astercore::{ComponentId, Result};
 use diagnostics::{init_diagnostics, DiagnosticConfig};
-use ipc::{transport, IpcRequest, RequestEnvelope, ResponseEnvelope, PROTOCOL_VERSION_1};
+use ipc::{
+    transport, IpcRequest, IpcResponse, RequestEnvelope, ResponseEnvelope, PROTOCOL_VERSION_1,
+};
 use platform_windows::{apply_native_taskbar_configuration, default_pipe_address};
 use slint::ComponentHandle;
 use std::env;
@@ -140,6 +142,116 @@ pub fn apply_taskbar_native_styles(win: &TaskbarWindow) -> Option<isize> {
     hwnd_opt
 }
 
+/// Manages the supervisor connection lifecycle with bounded exponential backoff retry and reconnection.
+pub async fn run_supervisor_connection_loop(
+    pipe_address: String,
+    is_running: Arc<AtomicBool>,
+    shutdown_notify: Arc<tokio::sync::Notify>,
+) {
+    let mut attempt = 0u32;
+    let initial_backoff = Duration::from_millis(100);
+    let max_backoff = Duration::from_secs(2);
+
+    while is_running.load(Ordering::SeqCst) {
+        tracing::info!(supervisor_pipe = %pipe_address, attempt, "Connecting to supervisor IPC...");
+
+        match transport::connect_pipe_client(&pipe_address).await {
+            Ok(mut client) => {
+                attempt = 0; // Reset backoff upon successful transport connection
+                let handshake_req = RequestEnvelope {
+                    request_id: 1,
+                    request: IpcRequest::Handshake {
+                        client_version: PROTOCOL_VERSION_1,
+                        client_name: "taskbar".to_string(),
+                    },
+                };
+
+                if let Err(e) = transport::write_framed_message(&mut client, &handshake_req).await {
+                    tracing::warn!(error = %e, "Failed to send supervisor handshake");
+                } else {
+                    let handshake_resp: Result<ResponseEnvelope> =
+                        transport::read_framed_message(&mut client).await;
+                    match handshake_resp {
+                        Ok(resp) if matches!(resp.response, IpcResponse::HandshakeAck { .. }) => {
+                            tracing::info!(
+                                response = ?resp.response,
+                                "Taskbar supervisor mutual handshake confirmed; entering supervised lifecycle"
+                            );
+
+                            // Active connection loop: wait for supervisor shutdown notice or connection drop
+                            loop {
+                                tokio::select! {
+                                    _ = shutdown_notify.notified() => {
+                                        tracing::debug!("Shutdown notification received; closing supervisor connection");
+                                        return;
+                                    }
+                                    incoming = transport::read_framed_message::<_, ResponseEnvelope>(&mut client) => {
+                                        match incoming {
+                                            Ok(env) => {
+                                                if matches!(env.response, IpcResponse::ShutdownNotice) {
+                                                    tracing::info!("Supervisor sent ShutdownNotice; commencing graceful taskbar termination");
+                                                    is_running.store(false, Ordering::SeqCst);
+                                                    let _ = slint::invoke_from_event_loop(|| {
+                                                        let _ = slint::quit_event_loop();
+                                                    });
+                                                    return;
+                                                }
+                                            }
+                                            Err(e) => {
+                                                tracing::info!(error = %e, "Supervisor connection dropped; entering reconnection lifecycle");
+                                                break; // Breaks inner loop to trigger reconnection
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Ok(resp) => {
+                            tracing::warn!(response = ?resp.response, "Supervisor handshake rejected");
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "Failed to read supervisor handshake response");
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    attempt,
+                    "Supervisor connection attempt failed; scheduling backoff retry"
+                );
+            }
+        }
+
+        if !is_running.load(Ordering::SeqCst) {
+            break;
+        }
+
+        // Calculate bounded exponential backoff with jitter
+        attempt = attempt.saturating_add(1);
+        let backoff_multiplier = 2u64.pow(attempt.min(5));
+        let jitter_ms = (std::process::id() as u64).wrapping_mul(attempt as u64) % 50;
+        let delay = (initial_backoff * backoff_multiplier as u32
+            + Duration::from_millis(jitter_ms))
+        .min(max_backoff);
+        tracing::debug!(
+            delay_ms = delay.as_millis(),
+            attempt,
+            "Waiting before supervisor reconnect attempt"
+        );
+
+        // Interruptible retry delay
+        tokio::select! {
+            _ = shutdown_notify.notified() => {
+                tracing::debug!("Shutdown notification interrupted reconnect backoff");
+                break;
+            }
+            _ = tokio::time::sleep(delay) => {}
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_diagnostics(DiagnosticConfig {
@@ -174,7 +286,11 @@ async fn main() -> Result<()> {
 
     // In test-child mode, connect to supervisor IPC, acknowledge handshake, and wait for shutdown/pipe break
     if is_test_child {
-        tracing::info!(supervisor_pipe = %supervisor_pipe, "Running in test-child mode: monitoring supervisor lifecycle");
+        tracing::info!(
+            supervisor_pipe = %supervisor_pipe,
+            connect_supervisor,
+            "Running in test-child mode: monitoring supervisor lifecycle"
+        );
         if connect_supervisor {
             if let Ok(mut client) = transport::connect_pipe_client(&supervisor_pipe).await {
                 let req = RequestEnvelope {
@@ -193,15 +309,19 @@ async fn main() -> Result<()> {
                     if let Ok(resp) = resp_res {
                         tracing::info!(response = ?resp.response, "Test-child handshake acknowledged");
                         loop {
-                            let incoming: Result<RequestEnvelope> =
+                            let incoming: Result<ResponseEnvelope> =
                                 transport::read_framed_message(&mut client).await;
                             match incoming {
-                                Ok(env) if matches!(env.request, IpcRequest::Shutdown) => {
-                                    tracing::info!("Test-child received Shutdown request via pipe");
+                                Ok(env) if matches!(env.response, IpcResponse::ShutdownNotice) => {
+                                    tracing::info!(
+                                        "Test-child received ShutdownNotice; exiting cleanly"
+                                    );
                                     break;
                                 }
                                 Err(_) => {
-                                    tracing::info!("Supervisor pipe closed; test-child exiting");
+                                    tracing::info!(
+                                        "Supervisor pipe closed; test-child exiting cleanly"
+                                    );
                                     break;
                                 }
                                 _ => {}
@@ -212,93 +332,38 @@ async fn main() -> Result<()> {
             } else {
                 tracing::warn!("Test-child failed to connect to supervisor pipe");
             }
+        } else {
+            // Standalone test-child loop: stays alive in sleep loop until OS or Job Object terminates it (LIFECYCLE-01)
+            loop {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
         }
         tracing::info!("AsterShell Taskbar test-child exited cleanly.");
         return Ok(());
     }
 
     let is_running = Arc::new(AtomicBool::new(true));
+    let shutdown_notify = Arc::new(tokio::sync::Notify::new());
 
-    // 1. Connect to ShellHost Supervisor via Named Pipe (AC-M3A-01)
+    // 1. Connect to ShellHost Supervisor via Named Pipe with reconnection (AC-M3A-01, SEC-01, INTEGRATION-01)
     if connect_supervisor {
         let is_running_sup = is_running.clone();
+        let shutdown_notify_sup = shutdown_notify.clone();
         let sup_addr = supervisor_pipe.clone();
         tokio::spawn(async move {
-            tracing::info!(supervisor_pipe = %sup_addr, "Connecting to supervisor IPC...");
-            match transport::connect_pipe_client(&sup_addr).await {
-                Ok(mut client) => {
-                    let req = RequestEnvelope {
-                        request_id: 1,
-                        request: IpcRequest::Handshake {
-                            client_version: PROTOCOL_VERSION_1,
-                            client_name: "taskbar".to_string(),
-                        },
-                    };
-                    if transport::write_framed_message(&mut client, &req)
-                        .await
-                        .is_ok()
-                    {
-                        let resp_res: Result<ResponseEnvelope> =
-                            transport::read_framed_message(&mut client).await;
-                        match resp_res {
-                            Ok(resp) => {
-                                tracing::info!(
-                                    response = ?resp.response,
-                                    "Taskbar supervisor mutual handshake confirmed"
-                                );
-
-                                // Read loop: wait for supervisor shutdown or pipe break
-                                while is_running_sup.load(Ordering::SeqCst) {
-                                    let incoming: Result<RequestEnvelope> =
-                                        transport::read_framed_message(&mut client).await;
-                                    match incoming {
-                                        Ok(env) if matches!(env.request, IpcRequest::Shutdown) => {
-                                            tracing::info!(
-                                                "Supervisor requested taskbar shutdown via pipe"
-                                            );
-                                            is_running_sup.store(false, Ordering::SeqCst);
-                                            let _ = slint::invoke_from_event_loop(|| {
-                                                let _ = slint::quit_event_loop();
-                                            });
-                                            break;
-                                        }
-                                        Err(_) => {
-                                            tracing::info!(
-                                                "Supervisor pipe closed; terminating taskbar lifecycle"
-                                            );
-                                            is_running_sup.store(false, Ordering::SeqCst);
-                                            let _ = slint::invoke_from_event_loop(|| {
-                                                let _ = slint::quit_event_loop();
-                                            });
-                                            break;
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, "Failed to read supervisor handshake response");
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::info!(
-                        error = %e,
-                        "Supervisor offline or unreachable; continuing in standalone companion mode"
-                    );
-                }
-            }
+            run_supervisor_connection_loop(sup_addr, is_running_sup, shutdown_notify_sup).await;
         });
     }
 
     // 2. Handle Ctrl+C signal
     {
         let is_running_ctrl = is_running.clone();
+        let shutdown_notify_ctrl = shutdown_notify.clone();
         tokio::spawn(async move {
             if tokio::signal::ctrl_c().await.is_ok() {
                 tracing::info!("Ctrl+C signal received, commencing graceful shutdown");
                 is_running_ctrl.store(false, Ordering::SeqCst);
+                shutdown_notify_ctrl.notify_waiters();
                 let _ = slint::invoke_from_event_loop(|| {
                     let _ = slint::quit_event_loop();
                 });
@@ -346,5 +411,95 @@ mod tests {
     #[test]
     fn test_taskbar_initialization() {
         assert_eq!(ComponentId::Taskbar.as_str(), "taskbar");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_supervisor_connection_loop_lifecycle_and_cancellation() {
+        let test_pipe = format!(r"\\.\pipe\astershell-test-loop-{}", std::process::id());
+        let is_running = Arc::new(AtomicBool::new(true));
+        let shutdown_notify = Arc::new(tokio::sync::Notify::new());
+
+        let is_running_clone = is_running.clone();
+        let shutdown_notify_clone = shutdown_notify.clone();
+        let pipe_addr = test_pipe.clone();
+
+        // 1. Start connection loop before server exists (tests initial backoff retry)
+        let loop_handle = tokio::spawn(async move {
+            run_supervisor_connection_loop(pipe_addr, is_running_clone, shutdown_notify_clone)
+                .await;
+        });
+
+        // Allow at least one transient connection failure / backoff wait
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // 2. Now start server and bind
+        let server = transport::create_pipe_server_with_security(&test_pipe, true, None)
+            .expect("create server");
+
+        let server_task = tokio::spawn(async move {
+            if server.connect().await.is_ok() {
+                let mut stream = server;
+                // Read handshake
+                let req_res: astercore::Result<RequestEnvelope> =
+                    transport::read_framed_message(&mut stream).await;
+                if let Ok(req) = req_res {
+                    assert!(matches!(req.request, IpcRequest::Handshake { .. }));
+                    let resp = ResponseEnvelope {
+                        request_id: req.request_id,
+                        response: IpcResponse::HandshakeAck {
+                            negotiated_version: PROTOCOL_VERSION_1,
+                            server_pid: std::process::id(),
+                        },
+                    };
+                    let _ = transport::write_framed_message(&mut stream, &resp).await;
+
+                    // Send ShutdownNotice to gracefully terminate connection
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    let notice = ResponseEnvelope {
+                        request_id: 0,
+                        response: IpcResponse::ShutdownNotice,
+                    };
+                    let _ = transport::write_framed_message(&mut stream, &notice).await;
+                }
+            }
+        });
+
+        let _ = server_task.await;
+        let _ = loop_handle.await;
+
+        assert!(
+            !is_running.load(Ordering::SeqCst),
+            "is_running must be false after ShutdownNotice"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconnect_backoff_shutdown_cancellation() {
+        let test_pipe = format!(r"\\.\pipe\astershell-test-cancel-{}", std::process::id());
+        let is_running = Arc::new(AtomicBool::new(true));
+        let shutdown_notify = Arc::new(tokio::sync::Notify::new());
+
+        let is_running_clone = is_running.clone();
+        let shutdown_notify_clone = shutdown_notify.clone();
+        let pipe_addr = test_pipe.clone();
+
+        let start = std::time::Instant::now();
+        let loop_handle = tokio::spawn(async move {
+            run_supervisor_connection_loop(pipe_addr, is_running_clone, shutdown_notify_clone)
+                .await;
+        });
+
+        // Cancel during backoff wait
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        is_running.store(false, Ordering::SeqCst);
+        shutdown_notify.notify_waiters();
+
+        let res = loop_handle.await;
+        assert!(res.is_ok());
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "Cancellation must promptly abort backoff"
+        );
     }
 }

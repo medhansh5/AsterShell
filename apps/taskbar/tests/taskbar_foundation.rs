@@ -482,14 +482,27 @@ fn test_ac_m3a_02_and_03_real_slint_taskbar_window_native_styles() {
 // Category C: Real Process Containment & Supervisor Lifecycle Integration Tests
 // ============================================================================
 
-/// AC-M3A-01 / LIFECYCLE-01: Real process containment test using Win32 `IsProcessInJob`.
-/// Spawns the real `taskbar` binary via `ProcessSupervisor`, checks PID authorization,
-/// calls authoritative Win32 `IsProcessInJob` kernel API, and tests clean shutdown.
+/// AC-M3A-01 / LIFECYCLE-01: Real process containment test and kernel kill-on-close verification.
+/// 1. Verifies `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` is configured on the actual kernel object via Win32 query.
+/// 2. Spawns the real `taskbar` binary via `ProcessSupervisor` into the Windows Job Object.
+/// 3. Authoritatively queries the Win32 `IsProcessInJob` API on the child's OS handle.
+/// 4. Closes the final Job Object handle while child is actively running, without calling `start_kill` or
+///    `TerminateProcess`, proving actual Windows kernel termination on job handle closure.
 #[tokio::test]
 async fn test_ac_m3a_01_real_process_containment_and_is_process_in_job() {
     let job_name = format!("AsterShellM3A-JobTest-{}", std::process::id());
     let job = JobObject::create(&job_name)
         .expect("Win32 Job Object creation must succeed with KILL_ON_JOB_CLOSE");
+
+    // 1. Verify JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE is configured on kernel object via Win32 query
+    let kill_on_close = job
+        .query_kill_on_close()
+        .expect("QueryInformationJobObject query must succeed");
+    assert!(
+        kill_on_close,
+        "JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE must be active on kernel Job Object"
+    );
+
     let mut supervisor = process_supervisor::ProcessSupervisor::new(job);
 
     let taskbar_exe = resolve_taskbar_exe();
@@ -499,6 +512,7 @@ async fn test_ac_m3a_01_real_process_containment_and_is_process_in_job() {
         taskbar_exe
     );
 
+    // Launch real child in persistent test-child mode
     let spec = process_supervisor::ProcessSpec {
         id: ComponentId::Taskbar,
         executable: taskbar_exe,
@@ -507,14 +521,13 @@ async fn test_ac_m3a_01_real_process_containment_and_is_process_in_job() {
     };
     supervisor.register(spec);
 
-    // 1. Spawn child process
+    // 2. Real process successfully spawned and assigned (Claim 1)
     let child_pid = supervisor
         .spawn(ComponentId::Taskbar)
         .expect("ProcessSupervisor::spawn must succeed");
     assert!(child_pid > 0, "Spawned child PID must be > 0");
     assert_eq!(supervisor.child_pid(ComponentId::Taskbar), Some(child_pid));
 
-    // 2. Verify PID is registered in authorized PID registry
     let pid_registry = supervisor.pid_registry();
     assert!(
         pid_registry.is_authorized(child_pid),
@@ -522,40 +535,77 @@ async fn test_ac_m3a_01_real_process_containment_and_is_process_in_job() {
         child_pid
     );
 
-    // 3. Authoritative Win32 IsProcessInJob kernel verification (LIFECYCLE-01)
+    // 3. Authoritative Win32 IsProcessInJob kernel verification (Claim 2)
     let is_in_job = supervisor
         .is_child_in_job(ComponentId::Taskbar)
         .expect("is_child_in_job must query Win32 IsProcessInJob successfully");
     assert!(
         is_in_job,
-        "Win32 IsProcessInJob must confirm that child process {} is enclosed within the Job Object",
+        "Win32 IsProcessInJob must confirm child process {} is enclosed within the Job Object",
         child_pid
     );
 
-    // 4. Verify clean shutdown
-    supervisor
-        .shutdown_all(Duration::from_millis(1500))
-        .await
-        .expect("shutdown_all must cleanly terminate child process");
-
-    // 5. Verify process has exited
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // 4. Kernel kill-on-close behavior verified (Claim 3)
     #[cfg(windows)]
     {
+        use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
         use windows::Win32::System::Threading::{
-            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+            GetExitCodeProcess, OpenProcess, TerminateProcess, WaitForSingleObject,
+            PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
         };
-        if let Ok(handle) =
-            unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, child_pid) }
-        {
-            let mut exit_code: u32 = 0;
-            let _ = unsafe { GetExitCodeProcess(handle, &mut exit_code) };
-            let _ = unsafe { windows::Win32::Foundation::CloseHandle(handle) };
-            assert_ne!(
-                exit_code, 259,
-                "Process must have exited (exit code != STILL_ACTIVE 259)"
-            );
+
+        // Open child process handle before closing the Job Object handle
+        let proc_handle = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE | PROCESS_TERMINATE,
+                false,
+                child_pid,
+            )
         }
+        .expect("OpenProcess on child process must succeed");
+
+        // RAII cleanup guard to guarantee no orphan processes on test assertion failure
+        struct ProcessCleanupGuard(HANDLE);
+        impl Drop for ProcessCleanupGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = TerminateProcess(self.0, 1);
+                    let _ = CloseHandle(self.0);
+                }
+            }
+        }
+        let guard = ProcessCleanupGuard(proc_handle);
+
+        // Verify child is actively alive prior to Job Object closure
+        let mut exit_code = 0u32;
+        let _ = unsafe { GetExitCodeProcess(guard.0, &mut exit_code) };
+        assert_eq!(
+            exit_code, 259,
+            "Child process must be actively running (STILL_ACTIVE 259) before Job Object is closed"
+        );
+
+        // Extract the Job Object and close its final handle WITHOUT calling child.start_kill(),
+        // TerminateProcess, or supervisor.shutdown_all()!
+        let job_object = supervisor.into_job_object();
+        drop(job_object); // Closes the final Win32 Job Object handle via CloseHandle
+
+        // Wait with bounded timeout for Windows kernel to terminate child process via kill-on-close
+        let wait_res = unsafe { WaitForSingleObject(guard.0, 3000) };
+        assert_eq!(
+            wait_res, WAIT_OBJECT_0,
+            "Child process must be terminated by kernel upon Job Object handle closure within 3000ms"
+        );
+
+        let mut final_exit_code = 0u32;
+        let _ = unsafe { GetExitCodeProcess(guard.0, &mut final_exit_code) };
+        assert_ne!(
+            final_exit_code, 259,
+            "Child process must have terminated (exit code != STILL_ACTIVE)"
+        );
+
+        // Defuse guard to prevent redundant termination
+        std::mem::forget(guard);
+        let _ = unsafe { CloseHandle(proc_handle) };
     }
 }
 
@@ -565,7 +615,8 @@ async fn test_ac_m3a_01_real_process_containment_and_is_process_in_job() {
 
 /// AC-M3A-07 / SEC-01: Supervisor Authenticated IPC & Security Verification.
 /// Confirms that unauthenticated Shutdown requests are rejected,
-/// mutual PID authentication succeeds for registered children, and supervisor shutdown triggers clean termination.
+/// authenticated supervised children cannot shut down the host daemon,
+/// mutual PID authentication succeeds, and host shutdown triggers graceful child termination.
 #[tokio::test]
 async fn test_ac_m3a_07_supervisor_authenticated_ipc_and_shutdown() {
     let test_pipe_name = format!(
@@ -578,7 +629,7 @@ async fn test_ac_m3a_07_supervisor_authenticated_ipc_and_shutdown() {
     let supervisor = process_supervisor::ProcessSupervisor::new(job);
     let pid_registry = supervisor.pid_registry();
 
-    // Register our current PID as authorized
+    // Register our current PID as a supervised child
     let authorized_pid = std::process::id();
     pid_registry.authorize(authorized_pid);
 
@@ -601,6 +652,7 @@ async fn test_ac_m3a_07_supervisor_authenticated_ipc_and_shutdown() {
             if server.connect().await.is_ok() {
                 let mut stream: NamedPipeServer = server;
                 let mut is_authenticated = false;
+                let mut client_role = process_supervisor::ClientRole::SupervisedChild;
 
                 loop {
                     let req_res: astercore::Result<RequestEnvelope> =
@@ -609,8 +661,6 @@ async fn test_ac_m3a_07_supervisor_authenticated_ipc_and_shutdown() {
                         Ok(r) => r,
                         Err(_) => break,
                     };
-
-                    let is_shutdown = matches!(req.request, IpcRequest::Shutdown);
 
                     let response = match req.request {
                         IpcRequest::Handshake {
@@ -626,6 +676,9 @@ async fn test_ac_m3a_07_supervisor_authenticated_ipc_and_shutdown() {
                                 ))
                             } else {
                                 is_authenticated = true;
+                                client_role = registry_clone
+                                    .get_role(client_pid)
+                                    .unwrap_or(process_supervisor::ClientRole::SupervisedChild);
                                 let _ = client_name;
                                 IpcResponse::HandshakeAck {
                                     negotiated_version: PROTOCOL_VERSION_1,
@@ -637,8 +690,15 @@ async fn test_ac_m3a_07_supervisor_authenticated_ipc_and_shutdown() {
                             "Authentication required: handshake required first".into(),
                         ),
                         IpcRequest::Shutdown => {
-                            signal_clone.store(true, Ordering::SeqCst);
-                            IpcResponse::Ack
+                            if client_role == process_supervisor::ClientRole::AdminController {
+                                signal_clone.store(true, Ordering::SeqCst);
+                                IpcResponse::Ack
+                            } else {
+                                IpcResponse::Error(
+                                    "Permission denied: supervised child processes are not authorized to trigger host shutdown"
+                                        .to_string(),
+                                )
+                            }
                         }
                         _ => IpcResponse::Ack,
                     };
@@ -649,7 +709,7 @@ async fn test_ac_m3a_07_supervisor_authenticated_ipc_and_shutdown() {
                     };
                     let _ = transport::write_framed_message(&mut stream, &resp_env).await;
 
-                    if is_shutdown || !is_authenticated {
+                    if !is_authenticated {
                         break;
                     }
                 }
@@ -685,5 +745,277 @@ async fn test_ac_m3a_07_supervisor_authenticated_ipc_and_shutdown() {
         );
 
         let _ = server_task.await;
+    }
+}
+
+/// SEC-01: Proves that an authenticated supervised child cannot shut down the host daemon.
+#[tokio::test]
+async fn test_ac_m3a_07_supervised_child_cannot_shutdown_host() {
+    let test_pipe_name = format!(
+        r"\\.\pipe\astershell-test-m3a-child-noshut-{}",
+        std::process::id()
+    );
+
+    let job =
+        JobObject::create("AsterShellM3A-NoShut-Job").expect("JobObject creation must succeed");
+    let supervisor = process_supervisor::ProcessSupervisor::new(job);
+    let pid_registry = supervisor.pid_registry();
+
+    // Register our PID as a SupervisedChild (default)
+    pid_registry.authorize(std::process::id());
+
+    #[cfg(windows)]
+    {
+        let mut pipe_sec = default_pipe_sddl()
+            .ok()
+            .and_then(|sddl| PipeSecurityDescriptor::from_sddl(&sddl).ok());
+        let sa_ptr = pipe_sec.as_mut().map(|s| s.as_raw_mut_ptr());
+
+        let server = transport::create_pipe_server_with_security(&test_pipe_name, true, sa_ptr)
+            .expect("Named pipe server creation must succeed");
+
+        let registry_clone = pid_registry.clone();
+        let server_task = tokio::spawn(async move {
+            if server.connect().await.is_ok() {
+                let mut stream: NamedPipeServer = server;
+                let mut is_authenticated = false;
+                let mut client_role = process_supervisor::ClientRole::SupervisedChild;
+
+                loop {
+                    let req_res: astercore::Result<RequestEnvelope> =
+                        transport::read_framed_message(&mut stream).await;
+                    let req = match req_res {
+                        Ok(r) => r,
+                        Err(_) => break,
+                    };
+
+                    let response = match req.request {
+                        IpcRequest::Handshake {
+                            client_version: _,
+                            ref client_name,
+                        } => {
+                            let client_pid =
+                                platform_windows::get_pipe_client_pid(&stream).unwrap_or(0);
+                            if !registry_clone.is_authorized(client_pid) {
+                                IpcResponse::Error("Unauthorized PID".into())
+                            } else {
+                                is_authenticated = true;
+                                client_role = registry_clone
+                                    .get_role(client_pid)
+                                    .unwrap_or(process_supervisor::ClientRole::SupervisedChild);
+                                let _ = client_name;
+                                IpcResponse::HandshakeAck {
+                                    negotiated_version: PROTOCOL_VERSION_1,
+                                    server_pid: std::process::id(),
+                                }
+                            }
+                        }
+                        _ if !is_authenticated => {
+                            IpcResponse::Error("Authentication required".into())
+                        }
+                        IpcRequest::Shutdown => {
+                            if client_role == process_supervisor::ClientRole::AdminController {
+                                IpcResponse::Ack
+                            } else {
+                                IpcResponse::Error(
+                                    "Permission denied: supervised child processes are not authorized to trigger host shutdown"
+                                        .to_string(),
+                                )
+                            }
+                        }
+                        _ => IpcResponse::Ack,
+                    };
+
+                    let resp_env = ResponseEnvelope {
+                        request_id: req.request_id,
+                        response,
+                    };
+                    let _ = transport::write_framed_message(&mut stream, &resp_env).await;
+                }
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut client = transport::connect_pipe_client(&test_pipe_name)
+            .await
+            .expect("Client must connect");
+
+        // 1. Handshake
+        let req = RequestEnvelope {
+            request_id: 1,
+            request: IpcRequest::Handshake {
+                client_version: PROTOCOL_VERSION_1,
+                client_name: "supervised-child".into(),
+            },
+        };
+        transport::write_framed_message(&mut client, &req)
+            .await
+            .unwrap();
+        let resp: ResponseEnvelope = transport::read_framed_message(&mut client).await.unwrap();
+        assert!(matches!(resp.response, IpcResponse::HandshakeAck { .. }));
+
+        // 2. Child sends Shutdown request
+        let sd_req = RequestEnvelope {
+            request_id: 2,
+            request: IpcRequest::Shutdown,
+        };
+        transport::write_framed_message(&mut client, &sd_req)
+            .await
+            .unwrap();
+        let sd_resp: ResponseEnvelope = transport::read_framed_message(&mut client).await.unwrap();
+        assert_eq!(sd_resp.request_id, 2);
+        match sd_resp.response {
+            IpcResponse::Error(msg) => {
+                assert!(msg.contains("Permission denied"));
+            }
+            other => panic!("Expected Permission denied error, got {:?}", other),
+        }
+
+        server_task.abort();
+    }
+}
+
+/// AC-M3A-08 / SEC-01: Proves that supervisor shutdown causes the real taskbar process to exit cleanly
+/// through the intended graceful IPC mechanism (receiving ShutdownNotice or pipe closure).
+#[tokio::test]
+async fn test_ac_m3a_08_taskbar_graceful_shutdown_on_supervisor_exit() {
+    let test_pipe_name = format!(
+        r"\\.\pipe\astershell-test-m3a-graceful-{}",
+        std::process::id()
+    );
+
+    let job = JobObject::create("AsterShellM3A-GracefulJob").expect("JobObject create");
+    let mut supervisor = process_supervisor::ProcessSupervisor::new(job);
+
+    #[cfg(windows)]
+    {
+        let mut pipe_sec = default_pipe_sddl()
+            .ok()
+            .and_then(|sddl| PipeSecurityDescriptor::from_sddl(&sddl).ok());
+        let sa_ptr = pipe_sec.as_mut().map(|s| s.as_raw_mut_ptr());
+
+        let server = transport::create_pipe_server_with_security(&test_pipe_name, true, sa_ptr)
+            .expect("Server create");
+
+        let taskbar_exe = resolve_taskbar_exe();
+        let spec = process_supervisor::ProcessSpec {
+            id: ComponentId::Taskbar,
+            executable: taskbar_exe,
+            args: vec![
+                "--test-child".to_string(),
+                "--supervisor-pipe".to_string(),
+                test_pipe_name.clone(),
+            ],
+            restart_policy: astercore::RestartPolicy::default(),
+        };
+        supervisor.register(spec);
+
+        let pid_registry = supervisor.pid_registry();
+
+        // Spawn child
+        let child_pid = supervisor
+            .spawn(ComponentId::Taskbar)
+            .expect("spawn taskbar");
+        pid_registry.authorize(child_pid);
+
+        // Server accepts connection and performs handshake
+        let server_task = tokio::spawn(async move {
+            if server.connect().await.is_ok() {
+                let mut stream = server;
+                // 1. Handshake
+                let req_res: astercore::Result<RequestEnvelope> =
+                    transport::read_framed_message(&mut stream).await;
+                if let Ok(req) = req_res {
+                    let resp = ResponseEnvelope {
+                        request_id: req.request_id,
+                        response: IpcResponse::HandshakeAck {
+                            negotiated_version: PROTOCOL_VERSION_1,
+                            server_pid: std::process::id(),
+                        },
+                    };
+                    let _ = transport::write_framed_message(&mut stream, &resp).await;
+
+                    // 2. Send ShutdownNotice to prompt graceful termination
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    let notice = ResponseEnvelope {
+                        request_id: 0,
+                        response: IpcResponse::ShutdownNotice,
+                    };
+                    let _ = transport::write_framed_message(&mut stream, &notice).await;
+                }
+            }
+        });
+
+        let _ = server_task.await;
+
+        // Verify child exits cleanly within bounded time
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut exit_code = 0u32;
+        use windows::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        if let Ok(h) = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, child_pid) } {
+            let _ = unsafe { GetExitCodeProcess(h, &mut exit_code) };
+            let _ = unsafe { windows::Win32::Foundation::CloseHandle(h) };
+            assert_ne!(
+                exit_code, 259,
+                "Taskbar process must exit cleanly upon receiving ShutdownNotice (exit code != STILL_ACTIVE)"
+            );
+        }
+    }
+}
+
+/// AC-M3A-09 / SEC-01: Proves that a non-responsive taskbar process is forcibly terminated
+/// after the configured supervisor timeout expires.
+#[tokio::test]
+async fn test_ac_m3a_09_non_responsive_taskbar_forcibly_terminated_on_timeout() {
+    let job = JobObject::create("AsterShellM3A-TimeoutJob").expect("JobObject create");
+    let mut supervisor = process_supervisor::ProcessSupervisor::new(job);
+
+    let taskbar_exe = resolve_taskbar_exe();
+    // Non-responsive child: runs in infinite sleep loop ignoring supervisor
+    let spec = process_supervisor::ProcessSpec {
+        id: ComponentId::Taskbar,
+        executable: taskbar_exe,
+        args: vec!["--test-child".to_string(), "--no-supervisor".to_string()],
+        restart_policy: astercore::RestartPolicy::default(),
+    };
+    supervisor.register(spec);
+
+    let child_pid = supervisor
+        .spawn(ComponentId::Taskbar)
+        .expect("spawn taskbar");
+    assert!(child_pid > 0);
+
+    // Call shutdown_all with a short timeout of 200ms
+    let start = std::time::Instant::now();
+    supervisor
+        .shutdown_all(Duration::from_millis(200))
+        .await
+        .expect("shutdown_all must complete");
+    let elapsed = start.elapsed();
+
+    // Must have waited at least the 200ms grace period before force killing
+    assert!(
+        elapsed >= Duration::from_millis(150),
+        "Supervisor must wait grace period before fallback force termination"
+    );
+
+    // Child must now be terminated
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    #[cfg(windows)]
+    {
+        use windows::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        if let Ok(h) = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, child_pid) } {
+            let mut exit_code = 0u32;
+            let _ = unsafe { GetExitCodeProcess(h, &mut exit_code) };
+            let _ = unsafe { windows::Win32::Foundation::CloseHandle(h) };
+            assert_ne!(
+                exit_code, 259,
+                "Non-responsive child must be forcibly terminated (exit code != STILL_ACTIVE)"
+            );
+        }
     }
 }

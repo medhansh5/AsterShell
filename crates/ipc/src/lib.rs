@@ -92,6 +92,7 @@ pub enum IpcResponse {
     ConfigJson(String),
     DiscoveredApps(Vec<DiscoveredApp>),
     Ack,
+    ShutdownNotice,
     Error(String),
 }
 

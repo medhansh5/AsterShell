@@ -58,6 +58,10 @@ impl ShellHostDaemon {
         self.supervisor.pid_registry().authorize(pid);
     }
 
+    pub fn authorize_admin_pid(&self, pid: u32) {
+        self.supervisor.pid_registry().authorize_admin(pid);
+    }
+
     pub fn supervisor(&self) -> &ProcessSupervisor {
         &self.supervisor
     }
@@ -95,21 +99,6 @@ impl ShellHostDaemon {
             "AsterShell Shell Host supervisor daemon starting..."
         );
 
-        // Register default configured components (INTEGRATION-01)
-        self.register_default_components();
-
-        // Automatically spawn enabled components
-        if self.config.taskbar.enabled {
-            match self.supervisor.spawn(ComponentId::Taskbar) {
-                Ok(pid) => {
-                    tracing::info!(pid, "Supervised taskbar companion spawned successfully");
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "Taskbar companion auto-start skipped (executable unavailable or headless)");
-                }
-            }
-        }
-
         let shutdown_tx = self.shutdown_tx.clone();
         let mut shutdown_rx_ipc = self.shutdown_rx.clone();
         let pipe_addr = self.pipe_address.clone();
@@ -117,9 +106,14 @@ impl ShellHostDaemon {
         let config_json = serde_json::to_string(&self.config).unwrap_or_default();
         let pid_registry = self.supervisor.pid_registry();
 
-        // Spawn IPC Named Pipe Listener
+        // 1. Channel to deterministically signal when the IPC listener is bound and ready to accept connections
+        let (listener_ready_tx, listener_ready_rx) = tokio::sync::oneshot::channel::<()>();
+
+        // 2. Spawn IPC Named Pipe Listener
         let ipc_task = tokio::spawn(async move {
             let mut is_first = true;
+            let mut ready_sender = Some(listener_ready_tx);
+
             while is_running.load(Ordering::SeqCst) {
                 #[cfg(windows)]
                 {
@@ -133,14 +127,20 @@ impl ShellHostDaemon {
                     {
                         Ok(server) => {
                             is_first = false;
+                            // Signal that the listener endpoint is bound and ready
+                            if let Some(tx) = ready_sender.take() {
+                                let _ = tx.send(());
+                            }
+
                             let s_tx = shutdown_tx.clone();
+                            let s_rx = shutdown_rx_ipc.clone();
                             let cfg_json = config_json.clone();
                             let registry = pid_registry.clone();
 
                             tokio::select! {
                                 res = server.connect() => {
                                     if res.is_ok() {
-                                        tokio::spawn(handle_client_connection(server, s_tx, cfg_json, registry));
+                                        tokio::spawn(handle_client_connection(server, s_tx, s_rx, cfg_json, registry));
                                     }
                                 }
                                 _ = shutdown_rx_ipc.changed() => {
@@ -159,11 +159,36 @@ impl ShellHostDaemon {
                 #[cfg(not(windows))]
                 {
                     let _ = pipe_addr;
+                    if let Some(tx) = ready_sender.take() {
+                        let _ = tx.send(());
+                    }
                     break;
                 }
             }
             tracing::info!("IPC server listener terminated cleanly");
         });
+
+        // 3. Wait deterministically for IPC listener readiness before spawning child components (INTEGRATION-01)
+        if listener_ready_rx.await.is_err() {
+            tracing::warn!("IPC listener readiness channel closed prematurely");
+        } else {
+            tracing::info!(pipe = %self.pipe_address, "IPC server endpoint bound and ready for connections");
+        }
+
+        // 4. Register default configured components (INTEGRATION-01)
+        self.register_default_components();
+
+        // 5. Automatically spawn enabled components
+        if self.config.taskbar.enabled {
+            match self.supervisor.spawn(ComponentId::Taskbar) {
+                Ok(pid) => {
+                    tracing::info!(pid, "Supervised taskbar companion spawned successfully");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Taskbar companion auto-start skipped (executable unavailable or headless)");
+                }
+            }
+        }
 
         // Supervisor main loop waiting for signal
         let mut shutdown_rx = self.shutdown_rx.clone();
@@ -179,7 +204,7 @@ impl ShellHostDaemon {
         self.is_running.store(false, Ordering::SeqCst);
         let _ = self.shutdown_tx.send(true);
 
-        // Shutdown supervised child processes cleanly
+        // Shutdown supervised child processes cleanly with bounded grace period
         self.supervisor
             .shutdown_all(Duration::from_millis(1500))
             .await?;
@@ -199,113 +224,145 @@ impl ShellHostDaemon {
 async fn handle_client_connection(
     mut stream: NamedPipeServer,
     shutdown_tx: watch::Sender<bool>,
+    mut shutdown_rx: watch::Receiver<bool>,
     config_json: String,
     pid_registry: process_supervisor::SupervisedPidRegistry,
 ) {
     let mut is_authenticated = false;
+    let mut client_role = process_supervisor::ClientRole::SupervisedChild;
+    let mut client_pid = 0u32;
 
     loop {
-        let req_res: Result<RequestEnvelope> = transport::read_framed_message(&mut stream).await;
-        let req = match req_res {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::debug!("Client disconnected or invalid frame: {}", e);
-                break;
-            }
-        };
+        let mut is_shutdown = false;
 
-        let is_shutdown = matches!(req.request, IpcRequest::Shutdown);
-
-        let response = match req.request {
-            IpcRequest::Handshake {
-                client_version,
-                ref client_name,
-            } => {
-                if is_authenticated {
-                    tracing::warn!(
-                        client = %client_name,
-                        "Protocol violation: connection already authenticated"
-                    );
-                    let resp_envelope = ResponseEnvelope {
-                        request_id: req.request_id,
-                        response: IpcResponse::Error(
-                            "Protocol violation: connection already authenticated".to_string(),
-                        ),
+        tokio::select! {
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    tracing::info!(client_pid, "Host shutting down; sending ShutdownNotice to client and closing pipe");
+                    let notice = ResponseEnvelope {
+                        request_id: 0,
+                        response: IpcResponse::ShutdownNotice,
                     };
-                    let _ = transport::write_framed_message(&mut stream, &resp_envelope).await;
+                    let _ = transport::write_framed_message(&mut stream, &notice).await;
                     break;
                 }
-
-                let client_pid = platform_windows::get_pipe_client_pid(&stream).unwrap_or(0);
-                if !pid_registry.is_authorized(client_pid) {
-                    tracing::warn!(
-                        client = %client_name,
-                        client_pid,
-                        "Mutual authentication failed: PID {} is not registered as a supervised child",
-                        client_pid
-                    );
-                    let resp_envelope = ResponseEnvelope {
-                        request_id: req.request_id,
-                        response: IpcResponse::Error(format!(
-                            "Mutual authentication failed: PID {} is not a supervised child process",
-                            client_pid
-                        )),
-                    };
-                    let _ = transport::write_framed_message(&mut stream, &resp_envelope).await;
-                    break;
-                }
-
-                is_authenticated = true;
-                tracing::info!(
-                    client = %client_name,
-                    client_version,
-                    client_pid,
-                    "IPC Client authenticated against supervised registry and connected"
-                );
-                IpcResponse::HandshakeAck {
-                    negotiated_version: PROTOCOL_VERSION_1,
-                    server_pid: std::process::id(),
-                }
             }
-            _ if !is_authenticated => {
-                tracing::warn!(
-                    "Unauthenticated request rejected: connection must authenticate via Handshake first"
-                );
+            req_res = transport::read_framed_message::<_, RequestEnvelope>(&mut stream) => {
+                let req = match req_res {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::debug!("Client disconnected or invalid frame: {}", e);
+                        break;
+                    }
+                };
+
+                let response = match req.request {
+                    IpcRequest::Handshake {
+                        client_version,
+                        ref client_name,
+                    } => {
+                        if is_authenticated {
+                            tracing::warn!(
+                                client = %client_name,
+                                "Protocol violation: connection already authenticated"
+                            );
+                            let resp_envelope = ResponseEnvelope {
+                                request_id: req.request_id,
+                                response: IpcResponse::Error(
+                                    "Protocol violation: connection already authenticated".to_string(),
+                                ),
+                            };
+                            let _ = transport::write_framed_message(&mut stream, &resp_envelope).await;
+                            break;
+                        }
+
+                        let pid = platform_windows::get_pipe_client_pid(&stream).unwrap_or(0);
+                        if !pid_registry.is_authorized(pid) {
+                            tracing::warn!(
+                                client = %client_name,
+                                client_pid = pid,
+                                "Mutual authentication failed: PID {} is not registered as a supervised child",
+                                pid
+                            );
+                            let resp_envelope = ResponseEnvelope {
+                                request_id: req.request_id,
+                                response: IpcResponse::Error(format!(
+                                    "Mutual authentication failed: PID {} is not a supervised child process",
+                                    pid
+                                )),
+                            };
+                            let _ = transport::write_framed_message(&mut stream, &resp_envelope).await;
+                            break;
+                        }
+
+                        client_pid = pid;
+                        client_role = pid_registry.get_role(pid).unwrap_or(process_supervisor::ClientRole::SupervisedChild);
+                        is_authenticated = true;
+                        tracing::info!(
+                            client = %client_name,
+                            client_version,
+                            client_pid,
+                            ?client_role,
+                            "IPC Client authenticated against supervised registry and connected"
+                        );
+                        IpcResponse::HandshakeAck {
+                            negotiated_version: PROTOCOL_VERSION_1,
+                            server_pid: std::process::id(),
+                        }
+                    }
+                    _ if !is_authenticated => {
+                        tracing::warn!(
+                            "Unauthenticated request rejected: connection must authenticate via Handshake first"
+                        );
+                        let resp_envelope = ResponseEnvelope {
+                            request_id: req.request_id,
+                            response: IpcResponse::Error(
+                                "Authentication required: connection must authenticate via Handshake first"
+                                    .to_string(),
+                            ),
+                        };
+                        let _ = transport::write_framed_message(&mut stream, &resp_envelope).await;
+                        break;
+                    }
+                    IpcRequest::Ping { timestamp_ms } => IpcResponse::Pong { timestamp_ms },
+                    IpcRequest::GetConfig => IpcResponse::ConfigJson(config_json.clone()),
+                    IpcRequest::DiscoverApps => {
+                        let apps = application_catalog::discover_installed_applications();
+                        IpcResponse::DiscoveredApps(apps)
+                    }
+                    IpcRequest::Shutdown => {
+                        if client_role == process_supervisor::ClientRole::AdminController {
+                            tracing::warn!("Admin controller requested shell host shutdown");
+                            is_shutdown = true;
+                            IpcResponse::Ack
+                        } else {
+                            tracing::warn!(
+                                client_pid,
+                                "Unauthorized shutdown attempt rejected from supervised child"
+                            );
+                            IpcResponse::Error(
+                                "Permission denied: supervised child processes are not authorized to trigger host shutdown"
+                                    .to_string(),
+                            )
+                        }
+                    }
+                };
+
                 let resp_envelope = ResponseEnvelope {
                     request_id: req.request_id,
-                    response: IpcResponse::Error(
-                        "Authentication required: connection must authenticate via Handshake first"
-                            .to_string(),
-                    ),
+                    response,
                 };
-                let _ = transport::write_framed_message(&mut stream, &resp_envelope).await;
-                break;
-            }
-            IpcRequest::Ping { timestamp_ms } => IpcResponse::Pong { timestamp_ms },
-            IpcRequest::GetConfig => IpcResponse::ConfigJson(config_json.clone()),
-            IpcRequest::DiscoverApps => {
-                let apps = application_catalog::discover_installed_applications();
-                IpcResponse::DiscoveredApps(apps)
-            }
-            IpcRequest::Shutdown => {
-                tracing::warn!("Client requested shell host shutdown");
-                IpcResponse::Ack
-            }
-        };
 
-        let resp_envelope = ResponseEnvelope {
-            request_id: req.request_id,
-            response,
-        };
+                if let Err(e) = transport::write_framed_message(&mut stream, &resp_envelope).await {
+                    tracing::error!("Failed to send IPC response: {}", e);
+                    break;
+                }
 
-        if let Err(e) = transport::write_framed_message(&mut stream, &resp_envelope).await {
-            tracing::error!("Failed to send IPC response: {}", e);
-            break;
-        }
-
-        if is_shutdown {
-            let _ = shutdown_tx.send(true);
-            break;
+                if is_shutdown {
+                    let _ = shutdown_tx.send(true);
+                    break;
+                }
+            }
         }
     }
 }
@@ -365,7 +422,7 @@ mod tests {
     #[tokio::test]
     async fn test_shell_host_ipc_lifecycle() {
         let mut daemon = ShellHostDaemon::new().expect("Failed to initialize daemon");
-        daemon.authorize_pid(std::process::id());
+        daemon.authorize_admin_pid(std::process::id());
         let pipe_addr = daemon.pipe_address().to_string();
 
         let daemon_task = tokio::spawn(async move {
@@ -384,7 +441,7 @@ mod tests {
             request_id: 1,
             request: IpcRequest::Handshake {
                 client_version: PROTOCOL_VERSION_1,
-                client_name: "test-runner".into(),
+                client_name: "admin-controller".into(),
             },
         };
         transport::write_framed_message(&mut client, &req)
@@ -435,7 +492,7 @@ mod tests {
             other => panic!("Expected DiscoveredApps, got {:?}", other),
         }
 
-        // 4. Shutdown request
+        // 4. Shutdown request from authorized Admin Controller
         let shutdown_req = RequestEnvelope {
             request_id: 4,
             request: IpcRequest::Shutdown,
@@ -451,6 +508,129 @@ mod tests {
         // Wait for daemon task to exit cleanly
         let daemon_res = daemon_task.await;
         assert!(daemon_res.is_ok(), "Daemon task must exit cleanly");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_shell_host_rejects_shutdown_from_supervised_child() {
+        let test_pipe = format!(r"\\.\pipe\astershell-test-child-sd-{}", std::process::id());
+        let mut daemon =
+            ShellHostDaemon::new_with_pipe(&test_pipe).expect("Failed to initialize daemon");
+        // Authorize with ordinary SupervisedChild role
+        daemon.authorize_pid(std::process::id());
+        let pipe_addr = daemon.pipe_address().to_string();
+
+        let daemon_task = tokio::spawn(async move {
+            let _ = daemon.run().await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let mut client = transport::connect_pipe_client(&pipe_addr)
+            .await
+            .expect("Client failed to connect to daemon pipe");
+
+        // 1. Handshake as supervised child
+        let handshake_req = RequestEnvelope {
+            request_id: 1,
+            request: IpcRequest::Handshake {
+                client_version: PROTOCOL_VERSION_1,
+                client_name: "taskbar-child".into(),
+            },
+        };
+        transport::write_framed_message(&mut client, &handshake_req)
+            .await
+            .unwrap();
+        let handshake_resp: ResponseEnvelope =
+            transport::read_framed_message(&mut client).await.unwrap();
+        assert!(matches!(
+            handshake_resp.response,
+            IpcResponse::HandshakeAck { .. }
+        ));
+
+        // 2. Child attempts Shutdown request (SEC-01)
+        let child_sd_req = RequestEnvelope {
+            request_id: 2,
+            request: IpcRequest::Shutdown,
+        };
+        transport::write_framed_message(&mut client, &child_sd_req)
+            .await
+            .unwrap();
+        let child_sd_resp: ResponseEnvelope =
+            transport::read_framed_message(&mut client).await.unwrap();
+        assert_eq!(child_sd_resp.request_id, 2);
+
+        match child_sd_resp.response {
+            IpcResponse::Error(msg) => {
+                assert!(
+                    msg.contains("Permission denied"),
+                    "Expected Permission denied error for supervised child shutdown, got: {}",
+                    msg
+                );
+            }
+            other => panic!(
+                "Expected IpcResponse::Error for child shutdown, got {:?}",
+                other
+            ),
+        }
+
+        // Verify daemon is still alive and running
+        assert!(
+            !daemon_task.is_finished(),
+            "Daemon must remain running after unauthorized child shutdown attempt"
+        );
+
+        daemon_task.abort();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_shell_host_shutdown_notice_sent_to_clients() {
+        let test_pipe = format!(r"\\.\pipe\astershell-test-sd-notice-{}", std::process::id());
+        let mut daemon =
+            ShellHostDaemon::new_with_pipe(&test_pipe).expect("Failed to initialize daemon");
+        daemon.authorize_pid(std::process::id());
+        let pipe_addr = daemon.pipe_address().to_string();
+
+        let trigger_sd = daemon.shutdown_tx.clone();
+
+        let daemon_task = tokio::spawn(async move {
+            let _ = daemon.run().await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let mut client = transport::connect_pipe_client(&pipe_addr)
+            .await
+            .expect("Client failed to connect to daemon pipe");
+
+        // Handshake
+        let handshake_req = RequestEnvelope {
+            request_id: 1,
+            request: IpcRequest::Handshake {
+                client_version: PROTOCOL_VERSION_1,
+                client_name: "test-client".into(),
+            },
+        };
+        transport::write_framed_message(&mut client, &handshake_req)
+            .await
+            .unwrap();
+        let handshake_resp: ResponseEnvelope =
+            transport::read_framed_message(&mut client).await.unwrap();
+        assert!(matches!(
+            handshake_resp.response,
+            IpcResponse::HandshakeAck { .. }
+        ));
+
+        // Trigger daemon shutdown
+        let _ = trigger_sd.send(true);
+
+        // Client should receive ShutdownNotice before pipe closes
+        let notice_resp: ResponseEnvelope =
+            transport::read_framed_message(&mut client).await.unwrap();
+        assert_eq!(notice_resp.response, IpcResponse::ShutdownNotice);
+
+        let _ = daemon_task.await;
     }
 
     #[cfg(windows)]
