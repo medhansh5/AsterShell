@@ -39,6 +39,11 @@ impl Config {
                 "Search max_results must be between 1 and 100".into(),
             ));
         }
+        if self.taskbar.monitor.trim().is_empty() {
+            return Err(AsterError::Config(
+                "Taskbar monitor target cannot be empty".into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -96,11 +101,17 @@ fn default_true() -> bool {
     true
 }
 
+fn default_monitor() -> String {
+    "primary".into()
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskbarConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
     pub position: String,
+    #[serde(default = "default_monitor")]
+    pub monitor: String,
     pub auto_hide: bool,
     pub live_thumbnails: bool,
 }
@@ -110,6 +121,7 @@ impl Default for TaskbarConfig {
         Self {
             enabled: true,
             position: "bottom".into(),
+            monitor: "primary".into(),
             auto_hide: false,
             live_thumbnails: true,
         }
@@ -200,6 +212,10 @@ mod tests {
         let mut config_bad_search = Config::default();
         config_bad_search.search.max_results = 0;
         assert!(config_bad_search.validate().is_err());
+
+        let mut config_bad_monitor = Config::default();
+        config_bad_monitor.taskbar.monitor = "   ".into();
+        assert!(config_bad_monitor.validate().is_err());
     }
 
     #[test]

@@ -11,7 +11,7 @@ use diagnostics::{init_diagnostics, DiagnosticConfig};
 use ipc::{
     transport, IpcRequest, IpcResponse, RequestEnvelope, ResponseEnvelope, PROTOCOL_VERSION_1,
 };
-use platform_windows::{apply_native_taskbar_configuration, default_pipe_address};
+use platform_windows::default_pipe_address;
 use slint::ComponentHandle;
 use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -117,8 +117,9 @@ slint::slint! {
     }
 }
 
-/// Applies native Win32 window styles, DWM Mica backdrop, and primary-monitor positioning.
-pub fn apply_taskbar_native_styles(win: &TaskbarWindow) -> Option<isize> {
+/// Applies native Win32 window styles, DWM Mica backdrop, target-monitor positioning,
+/// and installs dynamic display change / DPI change subclass monitoring.
+pub fn apply_taskbar_native_styles(win: &TaskbarWindow, monitor_target: &str) -> Option<isize> {
     use slint::winit_030::winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use slint::winit_030::WinitWindowAccessor;
 
@@ -134,8 +135,35 @@ pub fn apply_taskbar_native_styles(win: &TaskbarWindow) -> Option<isize> {
         .flatten();
 
     if let Some(hwnd) = hwnd_opt {
-        if let Err(e) = apply_native_taskbar_configuration(hwnd) {
-            tracing::warn!(error = %e, "Failed to apply native taskbar configuration");
+        // 1. DWM Immersive Dark Mode and Mica backdrop
+        if let Err(e) = platform_windows::apply_dark_mode_and_backdrop(
+            hwnd,
+            platform_windows::DwmBackdropType::Mica,
+        ) {
+            tracing::warn!(error = %e, "DWM Mica application returned fallback");
+        }
+
+        // 2. Configure native styles: WS_POPUP, WS_EX_TOPMOST, WS_EX_TOOLWINDOW, WS_EX_NOACTIVATE, !WS_EX_APPWINDOW
+        if let Err(e) = platform_windows::configure_taskbar_native_styles(hwnd) {
+            tracing::warn!(error = %e, "Failed to configure native taskbar window styles");
+        }
+
+        // 3. Position on target monitor
+        if let Err(e) =
+            platform_windows::reposition_taskbar_on_monitor(hwnd, monitor_target, 720, 48)
+        {
+            tracing::warn!(
+                error = %e,
+                monitor_target,
+                "Failed to position taskbar on target monitor"
+            );
+        }
+
+        // 4. Install display change subclass for dynamic repositioning on WM_DISPLAYCHANGE / WM_DPICHANGED
+        if let Err(e) =
+            platform_windows::install_display_change_subclass(hwnd, monitor_target, 720, 48)
+        {
+            tracing::warn!(error = %e, "Failed to install display change subclass");
         }
     }
 
@@ -265,6 +293,7 @@ async fn main() -> Result<()> {
     let mut supervisor_pipe = default_pipe_address();
     let mut connect_supervisor = true;
     let mut is_test_child = false;
+    let mut cli_monitor: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -279,10 +308,18 @@ async fn main() -> Result<()> {
             "--test-child" => {
                 is_test_child = true;
             }
+            "--monitor" if i + 1 < args.len() => {
+                cli_monitor = Some(args[i + 1].clone());
+                i += 1;
+            }
             _ => {}
         }
         i += 1;
     }
+
+    let config = configuration::load_config_from_path(&configuration::default_config_path())
+        .unwrap_or_default();
+    let monitor_target = cli_monitor.unwrap_or(config.taskbar.monitor);
 
     // In test-child mode, connect to supervisor IPC, acknowledge handshake, and wait for shutdown/pipe break
     if is_test_child {
@@ -381,17 +418,18 @@ async fn main() -> Result<()> {
     })?;
 
     // Initial native Win32 configuration
-    apply_taskbar_native_styles(&main_window);
+    apply_taskbar_native_styles(&main_window, &monitor_target);
 
     // Re-verify styles and placement on short timer once Winit message pump starts
     let win_weak = main_window.as_weak();
+    let target_for_timer = monitor_target.clone();
     let timer = slint::Timer::default();
     timer.start(
         slint::TimerMode::SingleShot,
         Duration::from_millis(50),
         move || {
             if let Some(win) = win_weak.upgrade() {
-                apply_taskbar_native_styles(&win);
+                apply_taskbar_native_styles(&win, &target_for_timer);
             }
         },
     );

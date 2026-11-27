@@ -14,6 +14,7 @@ tracing = { workspace = true }
 tokio = { workspace = true }
 ipc = { workspace = true }
 platform-windows = { workspace = true }
+configuration = { workspace = true }
 slint = { version = "1.19", features = ["backend-winit", "unstable-winit-030"] }
 
 [dev-dependencies]

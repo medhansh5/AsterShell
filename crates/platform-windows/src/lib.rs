@@ -1,9 +1,15 @@
 //! AsterShell Platform Layer — Windows API and System Abstractions
 
 pub mod hotkey;
+pub mod monitor;
 pub mod window;
 
 pub use hotkey::{register_global_hotkey, GlobalHotkeyHandle, HotkeyConfig, HotkeyError};
+pub use monitor::{
+    calculate_monitor_taskbar_coordinates, enumerate_monitors, find_monitor_by_target,
+    find_primary_monitor, install_display_change_subclass, reposition_taskbar_on_monitor,
+    MonitorInfo,
+};
 pub use window::{
     apply_dark_mode_and_backdrop, apply_native_taskbar_configuration,
     calculate_spotlight_coordinates, calculate_spotlight_coordinates_with_dpi,
