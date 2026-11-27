@@ -126,3 +126,29 @@ pub struct ErrorPayload {
 2. When the configuration file is modified on disk, `shell-host` detects the modification using `ReadDirectoryChangesW`.
 3. `shell-host` validates the updated schema. If valid, it broadcasts a `ConfigPayload::UpdateBroadcast` message across all active child pipes.
 4. UI components apply hot-reloaded visual changes (colors, theme, dimensions) dynamically without restarting.
+
+---
+
+## 6. Lifecycle & Security Authorization Specification (M3A.2)
+
+### 6.1. Role-Based Authorization
+Authenticated connections are categorized into distinct operational roles:
+1. **`SupervisedChild`**: Ordinary child companion process (e.g., `taskbar`, `search-ui`).
+   - Granted access to `Ping`, `GetConfig`, and `DiscoverApps`.
+   - **Strictly denied** host administration privileges: any `IpcRequest::Shutdown` sent by a `SupervisedChild` is rejected with `Permission denied`.
+2. **`AdminController`**: Administrative controller (e.g., host CLI, test runner, elevated shell controller).
+   - Authorized to issue `IpcRequest::Shutdown` to trigger daemon termination.
+
+### 6.2. Supervisor-to-Child Graceful Shutdown Protocol
+Graceful termination of child processes proceeds through deterministic notification and bounded grace periods:
+1. When `shell-host` initiates shutdown, the server sends `ResponseEnvelope { request_id: 0, response: IpcResponse::ShutdownNotice }` across all active authenticated client streams and closes listener acceptance.
+2. The child process receives `ShutdownNotice` (or detects transport EOF), breaks its UI event loop, and cleanly terminates with exit code 0.
+3. The supervisor waits for a bounded grace period (default 1500ms).
+4. If a child process is hung or non-responsive, the supervisor forcibly terminates the process via `start_kill` as a fallback.
+5. Windows Job Objects with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` enforce kernel-level process containment if the supervisor process itself crashes.
+
+### 6.3. Deterministic Startup & Reconnection State Machine
+1. **Startup Ordering**: `shell-host` binds the named pipe listener and waits for a deterministic readiness signal before spawning child components.
+2. **Exponential Backoff**: If a connection fails or is severed, child components retry using bounded exponential backoff with jitter (initial 100ms, max 2000ms).
+3. **Re-authentication**: Every re-established transport connection performs a fresh `Handshake` and re-authenticates its PID against the supervisor's `SupervisedPidRegistry`.
+4. **Shutdown Cancellation**: Active shutdown notifications cancel pending retry timers immediately without unmanaged background threads.

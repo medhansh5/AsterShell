@@ -95,11 +95,16 @@ To prevent race conditions, IPC deadlocks, and visual flickering during startup,
 
 ---
 
-## 4. Graceful Shutdown & Teardown
+## 4. Graceful Shutdown & Teardown (M3A.2 Verified)
 
-1. **Broadcast Shutdown Message:** `shell-host` sends an `IpcMessage::System(SystemCommand::Shutdown)` frame across all open named-pipe connections.
-2. **Child Cleanup:**
-   - `taskbar` calls `SHAppBarMessage(ABM_REMOVE)` to restore the original Windows work area rectangle.
+1. **Broadcast Shutdown Notice:** `shell-host` sends an `IpcResponse::ShutdownNotice` frame across all active authenticated named-pipe client connections and terminates listener acceptance.
+2. **Child Voluntary Teardown:**
+   - `taskbar` operates as a floating companion (zero work area modification) and cleanly terminates its Slint UI event loop and winit window upon receiving `ShutdownNotice` or detecting pipe EOF.
    - `desktop` closes rendering surfaces and unhooks DWM backdrops.
    - `search-ui` closes local SQLite connection handles.
-3. **Termination Grace Period:** `shell-host` allows 1,500 ms for child processes to exit cleanly. Any remaining processes are forcefully terminated by closing the Job Object handle.
+3. **Termination Grace Period:**
+   - `shell-host` allows a bounded grace period (1,500 ms) for supervised child processes to exit voluntarily.
+   - Any child process remaining alive after the timeout expires is forcefully terminated via `child.start_kill()`.
+4. **Kernel Job Object Containment:**
+   - If the supervisor process itself crashes, is killed, or drops its handles, the Windows kernel terminates all enclosed child processes automatically via `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
+   - Verified through authoritative `QueryInformationJobObject` and `IsProcessInJob` Win32 tests without manual `TerminateProcess` intervention.
