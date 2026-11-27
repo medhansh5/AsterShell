@@ -12,8 +12,9 @@ pub use audio::{query_master_volume, AudioMonitorHandle, AudioVolumeState};
 pub use hotkey::{register_global_hotkey, GlobalHotkeyHandle, HotkeyConfig, HotkeyError};
 pub use monitor::{
     calculate_monitor_taskbar_coordinates, enumerate_monitors, find_monitor_by_target,
-    find_primary_monitor, install_display_change_subclass, reposition_taskbar_on_monitor,
-    MonitorInfo,
+    find_primary_monitor, install_display_change_subclass,
+    install_display_change_subclass_with_callback, remove_display_change_subclass,
+    reposition_taskbar_on_monitor, MonitorInfo,
 };
 pub use network::{query_network_status, NetworkMonitorHandle, NetworkStatus};
 pub use power::{query_power_status, PowerMonitorHandle, PowerStatus};

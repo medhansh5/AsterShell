@@ -263,95 +263,151 @@ struct SubclassContext {
     monitor_target: String,
     logical_width: i32,
     logical_height: i32,
+    on_display_change: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    drop_counter: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+}
+
+impl Drop for SubclassContext {
+    fn drop(&mut self) {
+        if let Some(counter) = &self.drop_counter {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
 }
 
 const SUBCLASS_ID_DISPLAY_CHANGE: usize = 0xAA01;
 
-/// Installs a Win32 window subclass on the taskbar HWND to intercept `WM_DISPLAYCHANGE`
-/// and `WM_DPICHANGED` messages, automatically recalculating coordinates and repositioning
-/// the taskbar window without destroying UI state.
+#[cfg(windows)]
+fn subclass_registry(
+) -> &'static std::sync::Mutex<std::collections::HashMap<isize, std::sync::Arc<SubclassContext>>> {
+    static REGISTRY: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<isize, std::sync::Arc<SubclassContext>>>,
+    > = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn display_change_subclass_proc(
+    hwnd: windows::Win32::Foundation::HWND,
+    umsg: u32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: windows::Win32::Foundation::LPARAM,
+    uidsubclass: usize,
+    _dwrefdata: usize,
+) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass};
+    use windows::Win32::UI::WindowsAndMessaging::{WM_DISPLAYCHANGE, WM_DPICHANGED, WM_NCDESTROY};
+
+    let hwnd_raw = hwnd.0 as isize;
+
+    match umsg {
+        WM_DISPLAYCHANGE | WM_DPICHANGED => {
+            let ctx_opt = subclass_registry()
+                .lock()
+                .ok()
+                .and_then(|map| map.get(&hwnd_raw).cloned());
+
+            if let Some(ctx) = ctx_opt {
+                tracing::info!(
+                    msg = umsg,
+                    target = %ctx.monitor_target,
+                    "Display topology or DPI change notification received; recalculating placement"
+                );
+
+                let _ = reposition_taskbar_on_monitor(
+                    hwnd_raw,
+                    &ctx.monitor_target,
+                    ctx.logical_width,
+                    ctx.logical_height,
+                );
+                if let Some(cb) = &ctx.on_display_change {
+                    cb();
+                }
+            }
+            DefSubclassProc(hwnd, umsg, wparam, lparam)
+        }
+        WM_NCDESTROY => {
+            tracing::debug!("Taskbar window destroying; cleaning up display change subclass");
+            let _ = RemoveWindowSubclass(hwnd, Some(display_change_subclass_proc), uidsubclass);
+            if let Ok(mut map) = subclass_registry().lock() {
+                map.remove(&hwnd_raw);
+            }
+            DefSubclassProc(hwnd, umsg, wparam, lparam)
+        }
+        _ => DefSubclassProc(hwnd, umsg, wparam, lparam),
+    }
+}
+
+/// Installs (or atomically updates without leaking) a Win32 window subclass on the taskbar HWND
+/// to intercept `WM_DISPLAYCHANGE` and `WM_DPICHANGED` messages.
 pub fn install_display_change_subclass(
     hwnd: isize,
     monitor_target: &str,
     logical_width: i32,
     logical_height: i32,
 ) -> Result<()> {
+    install_display_change_subclass_with_callback(
+        hwnd,
+        monitor_target,
+        logical_width,
+        logical_height,
+        None,
+        None,
+    )
+}
+
+/// Installs or updates the display-change subclass with an optional notification callback.
+pub fn install_display_change_subclass_with_callback(
+    hwnd: isize,
+    monitor_target: &str,
+    logical_width: i32,
+    logical_height: i32,
+    on_display_change: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    drop_counter: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+) -> Result<()> {
     #[cfg(windows)]
     {
-        use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-        use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
-        use windows::Win32::UI::WindowsAndMessaging::{
-            WM_DISPLAYCHANGE, WM_DPICHANGED, WM_NCDESTROY,
-        };
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::Shell::SetWindowSubclass;
 
-        unsafe extern "system" fn subclass_proc(
-            hwnd: HWND,
-            umsg: u32,
-            wparam: WPARAM,
-            lparam: LPARAM,
-            uidsubclass: usize,
-            dwrefdata: usize,
-        ) -> LRESULT {
-            let ctx = &*(dwrefdata as *const SubclassContext);
-
-            match umsg {
-                WM_DISPLAYCHANGE | WM_DPICHANGED => {
-                    tracing::info!(
-                        msg = umsg,
-                        target = %ctx.monitor_target,
-                        "Display topology or DPI change notification received; recalculating placement"
-                    );
-
-                    let _ = reposition_taskbar_on_monitor(
-                        hwnd.0 as isize,
-                        &ctx.monitor_target,
-                        ctx.logical_width,
-                        ctx.logical_height,
-                    );
-                    DefSubclassProc(hwnd, umsg, wparam, lparam)
-                }
-                WM_NCDESTROY => {
-                    tracing::debug!(
-                        "Taskbar window destroying; cleaning up display change subclass"
-                    );
-                    let _ = RemoveWindowSubclass(hwnd, Some(subclass_proc), uidsubclass);
-                    let _ = Box::from_raw(dwrefdata as *mut SubclassContext);
-                    DefSubclassProc(hwnd, umsg, wparam, lparam)
-                }
-                _ => DefSubclassProc(hwnd, umsg, wparam, lparam),
-            }
-        }
-
-        let ctx = Box::new(SubclassContext {
+        let handle = HWND(hwnd as _);
+        let ctx = std::sync::Arc::new(SubclassContext {
             monitor_target: monitor_target.to_string(),
             logical_width,
             logical_height,
+            on_display_change,
+            drop_counter,
         });
-        let raw_ctx = Box::into_raw(ctx) as usize;
 
-        let handle = HWND(hwnd as _);
-        let ok = unsafe {
-            SetWindowSubclass(
-                handle,
-                Some(subclass_proc),
-                SUBCLASS_ID_DISPLAY_CHANGE,
-                raw_ctx,
-            )
-        };
+        let mut map = subclass_registry()
+            .lock()
+            .map_err(|_| AsterError::Platform("Subclass registry lock poisoned".into()))?;
 
-        if !ok.as_bool() {
-            // Reclaim box to prevent leak on failure
-            unsafe {
-                let _ = Box::from_raw(raw_ctx as *mut SubclassContext);
+        let already_installed = map.contains_key(&hwnd);
+        map.insert(hwnd, ctx);
+
+        if !already_installed {
+            let ok = unsafe {
+                SetWindowSubclass(
+                    handle,
+                    Some(display_change_subclass_proc),
+                    SUBCLASS_ID_DISPLAY_CHANGE,
+                    0,
+                )
+            };
+
+            if !ok.as_bool() {
+                map.remove(&hwnd);
+                return Err(AsterError::Platform(
+                    "Failed to install SetWindowSubclass for display change monitoring".into(),
+                ));
             }
-            return Err(AsterError::Platform(
-                "Failed to install SetWindowSubclass for display change monitoring".into(),
-            ));
         }
 
         tracing::info!(
             hwnd,
             monitor_target,
+            replaced_existing = already_installed,
             "Installed display change subclass handler on taskbar window"
         );
         Ok(())
@@ -359,8 +415,47 @@ pub fn install_display_change_subclass(
 
     #[cfg(not(windows))]
     {
-        let _ = (hwnd, monitor_target, logical_width, logical_height);
+        let _ = (
+            hwnd,
+            monitor_target,
+            logical_width,
+            logical_height,
+            on_display_change,
+            drop_counter,
+        );
         Ok(())
+    }
+}
+
+/// Explicitly removes the display change subclass from an HWND and reclaims its context.
+pub fn remove_display_change_subclass(hwnd: isize) -> Result<bool> {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::Shell::RemoveWindowSubclass;
+
+        let mut map = subclass_registry()
+            .lock()
+            .map_err(|_| AsterError::Platform("Subclass registry lock poisoned".into()))?;
+
+        if map.remove(&hwnd).is_some() {
+            let handle = HWND(hwnd as _);
+            unsafe {
+                let _ = RemoveWindowSubclass(
+                    handle,
+                    Some(display_change_subclass_proc),
+                    SUBCLASS_ID_DISPLAY_CHANGE,
+                );
+            }
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = hwnd;
+        Ok(false)
     }
 }
 
@@ -449,5 +544,60 @@ mod tests {
         let fallback =
             find_monitor_by_target("NON_EXISTENT_DISPLAY_XYZ").expect("Fallback to primary");
         assert_eq!(fallback.device_name, primary.device_name);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_install_display_change_subclass_idempotent_no_leak() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use windows::core::{HSTRING, PCWSTR};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, HWND_MESSAGE,
+        };
+
+        let hwnd = unsafe {
+            CreateWindowExW(
+                Default::default(),
+                PCWSTR(HSTRING::from("STATIC").as_ptr()),
+                PCWSTR(HSTRING::from("AsterSubclassTest").as_ptr()),
+                Default::default(),
+                0,
+                0,
+                0,
+                0,
+                HWND_MESSAGE,
+                None,
+                None,
+                None,
+            )
+            .expect("CreateWindowExW for test")
+        };
+
+        let drop_counter = Arc::new(AtomicUsize::new(0));
+        for _ in 0..10 {
+            install_display_change_subclass_with_callback(
+                hwnd.0 as isize,
+                "primary",
+                720,
+                48,
+                None,
+                Some(drop_counter.clone()),
+            )
+            .expect("install_display_change_subclass_with_callback");
+        }
+
+        // 9 prior contexts must already have been reclaimed during repeated installs
+        assert_eq!(drop_counter.load(Ordering::SeqCst), 9);
+
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
+
+        // DestroyWindow triggers WM_NCDESTROY, reclaiming the 10th and final context
+        assert_eq!(drop_counter.load(Ordering::SeqCst), 10);
+
+        // Removing after destruction is a safe no-op (no double-free)
+        assert!(!remove_display_change_subclass(hwnd.0 as isize).unwrap_or(false));
     }
 }
