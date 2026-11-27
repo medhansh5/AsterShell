@@ -3,7 +3,19 @@
 //! Provides Win32 window positioning, multi-monitor query relative to cursor,
 //! and DWM backdrop styling (Mica / Acrylic / Dark Mode).
 
-use astercore::{AsterError, Result};
+pub use astercore::{AsterError, Result};
+
+pub const WS_POPUP_FLAG: u32 = 0x8000_0000;
+pub const WS_VISIBLE_FLAG: u32 = 0x1000_0000;
+pub const WS_CLIPSIBLINGS_FLAG: u32 = 0x0400_0000;
+pub const WS_CLIPCHILDREN_FLAG: u32 = 0x0200_0000;
+pub const WS_CAPTION_FLAG: u32 = 0x00C0_0000;
+pub const WS_THICKFRAME_FLAG: u32 = 0x0004_0000;
+pub const WS_SYSMENU_FLAG: u32 = 0x0008_0000;
+pub const WS_EX_TOPMOST_FLAG: u32 = 0x0000_0008;
+pub const WS_EX_TOOLWINDOW_FLAG: u32 = 0x0000_0080;
+pub const WS_EX_NOACTIVATE_FLAG: u32 = 0x0800_0000;
+pub const WS_EX_APPWINDOW_FLAG: u32 = 0x0004_0000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DwmBackdropType {
@@ -273,4 +285,290 @@ pub fn position_window(hwnd: isize, x: i32, y: i32, width: i32, height: i32) -> 
     }
 
     Ok(())
+}
+
+/// Retrieves the working area rectangle of the primary monitor using signed `i32` coordinates.
+///
+/// Queries `MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY)` and `GetMonitorInfoW`.
+/// Falls back to `SystemParametersInfoW(SPI_GETWORKAREA)` and standard fallback resolutions.
+pub fn get_primary_monitor_work_area() -> Result<Rect> {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::{POINT, RECT};
+        use windows::Win32::Graphics::Gdi::{
+            GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTOPRIMARY,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetSystemMetrics, SystemParametersInfoW, SM_CXSCREEN, SM_CYSCREEN, SPI_GETWORKAREA,
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+        };
+
+        let origin = POINT { x: 0, y: 0 };
+        let hmonitor = unsafe { MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY) };
+        if !hmonitor.is_invalid() {
+            let mut mi = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+
+            let ok = unsafe { GetMonitorInfoW(hmonitor, &mut mi) };
+            if ok.as_bool() {
+                return Ok(Rect {
+                    left: mi.rcWork.left,
+                    top: mi.rcWork.top,
+                    right: mi.rcWork.right,
+                    bottom: mi.rcWork.bottom,
+                });
+            }
+        }
+
+        // Fallback 1: SystemParametersInfoW for primary monitor work area (excludes taskbar)
+        let mut work_rect = RECT::default();
+        let spi_res = unsafe {
+            SystemParametersInfoW(
+                SPI_GETWORKAREA,
+                0,
+                Some(&mut work_rect as *mut _ as *mut std::ffi::c_void),
+                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+            )
+        };
+
+        if spi_res.is_ok()
+            && (work_rect.right > work_rect.left)
+            && (work_rect.bottom > work_rect.top)
+        {
+            return Ok(Rect {
+                left: work_rect.left,
+                top: work_rect.top,
+                right: work_rect.right,
+                bottom: work_rect.bottom,
+            });
+        }
+
+        // Fallback 2: GetSystemMetrics screen resolution
+        let cx = unsafe { GetSystemMetrics(SM_CXSCREEN) };
+        let cy = unsafe { GetSystemMetrics(SM_CYSCREEN) };
+        if cx > 0 && cy > 0 {
+            return Ok(Rect {
+                left: 0,
+                top: 0,
+                right: cx,
+                bottom: cy,
+            });
+        }
+
+        // Fallback 3: Standard 1080p fallback
+        Ok(Rect {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        })
+    }
+
+    #[cfg(not(windows))]
+    {
+        Ok(Rect {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        })
+    }
+}
+
+/// Retrieves the Win32 window style and extended style for a given HWND.
+///
+/// Returns `(style, ex_style)` as `(u32, u32)`.
+pub fn get_window_styles(hwnd: isize) -> Result<(u32, u32)> {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrW, GWL_EXSTYLE, GWL_STYLE};
+
+        let handle = HWND(hwnd as _);
+        let style = unsafe { GetWindowLongPtrW(handle, GWL_STYLE) } as u32;
+        let ex_style = unsafe { GetWindowLongPtrW(handle, GWL_EXSTYLE) } as u32;
+
+        Ok((style, ex_style))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = hwnd;
+        Ok((0, 0))
+    }
+}
+
+/// Configures native Win32 window styles for the AsterTaskbar floating companion window.
+///
+/// Ensures:
+/// - Base: `WS_POPUP | WS_VISIBLE | WS_CLIPSIBLINGS | WS_CLIPCHILDREN`
+/// - Extended: `WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE`
+/// - Strips: `WS_EX_APPWINDOW`
+///
+/// Flushes the style changes via `SetWindowPos` with `SWP_FRAMECHANGED` without activating or moving the window.
+/// Returns the verified `(style, ex_style)` read back after application.
+pub fn configure_taskbar_native_styles(hwnd: isize) -> Result<(u32, u32)> {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE, GWL_STYLE,
+            HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WS_CAPTION,
+            WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+            WS_EX_TOPMOST, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
+            WS_VISIBLE,
+        };
+
+        let handle = HWND(hwnd as _);
+
+        // 1. Read existing styles
+        let current_style = unsafe { GetWindowLongPtrW(handle, GWL_STYLE) } as u32;
+        let current_ex_style = unsafe { GetWindowLongPtrW(handle, GWL_EXSTYLE) } as u32;
+
+        // 2. Compute target base style: ensure POPUP, VISIBLE, CLIPSIBLINGS, CLIPCHILDREN are set,
+        // and explicitly strip title-bar, resize-borders, and sysmenu frames (WINDOW-01).
+        let unwanted_frame_bits =
+            WS_CAPTION.0 | WS_THICKFRAME.0 | WS_MINIMIZEBOX.0 | WS_MAXIMIZEBOX.0 | WS_SYSMENU.0;
+        let target_style =
+            (current_style | WS_POPUP.0 | WS_VISIBLE.0 | WS_CLIPSIBLINGS.0 | WS_CLIPCHILDREN.0)
+                & !unwanted_frame_bits;
+
+        // 3. Compute target extended style: add TOPMOST, TOOLWINDOW, NOACTIVATE; strip APPWINDOW
+        let target_ex_style =
+            (current_ex_style | WS_EX_TOPMOST.0 | WS_EX_TOOLWINDOW.0 | WS_EX_NOACTIVATE.0)
+                & !WS_EX_APPWINDOW.0;
+
+        // 4. Apply via SetWindowLongPtrW
+        unsafe {
+            SetWindowLongPtrW(handle, GWL_STYLE, target_style as isize);
+            SetWindowLongPtrW(handle, GWL_EXSTYLE, target_ex_style as isize);
+        }
+
+        // 5. Force frame update and HWND_TOPMOST without moving or stealing focus
+        unsafe {
+            use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOWNA};
+            let _ = ShowWindow(handle, SW_SHOWNA);
+            let _ = SetWindowPos(
+                handle,
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            );
+        }
+
+        // 6. Read back verified styles
+        let verified_style = unsafe { GetWindowLongPtrW(handle, GWL_STYLE) } as u32;
+        let mut verified_ex_style = unsafe { GetWindowLongPtrW(handle, GWL_EXSTYLE) } as u32;
+
+        if (verified_ex_style & WS_EX_TOPMOST.0) == 0 {
+            unsafe {
+                let _ = SetWindowPos(
+                    handle,
+                    HWND_TOPMOST,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+                );
+            }
+            verified_ex_style = unsafe { GetWindowLongPtrW(handle, GWL_EXSTYLE) } as u32;
+        }
+
+        tracing::info!(
+            hwnd,
+            style = format_args!("{:#010x}", verified_style),
+            ex_style = format_args!("{:#010x}", verified_ex_style),
+            "Taskbar native window styles configured and verified"
+        );
+
+        Ok((verified_style, verified_ex_style))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = hwnd;
+        Ok((0, 0))
+    }
+}
+
+/// Computes the horizontal center and top placement coordinates (X, Y) and physical dimensions
+/// for the floating companion taskbar window on the primary monitor using signed `i32` coordinates.
+///
+/// Places the window horizontally centered at the top of the primary monitor's work area:
+/// - `x = work.left + (work.width() - physical_width) / 2`
+/// - `y = work.top`
+pub fn calculate_taskbar_coordinates_with_dpi(
+    logical_width: i32,
+    logical_height: i32,
+    dpi: u32,
+) -> Result<(i32, i32, i32, i32)> {
+    let work = get_primary_monitor_work_area()?;
+    let physical_width = scale_to_physical_pixels(logical_width, dpi);
+    let physical_height = scale_to_physical_pixels(logical_height, dpi);
+
+    let x = work.left + (work.width() - physical_width) / 2;
+    let y = work.top;
+    Ok((x, y, physical_width, physical_height))
+}
+
+/// Positions and sizes the taskbar window at the specified coordinates, ensuring it remains
+/// `HWND_TOPMOST`, shown, and does not activate or steal focus.
+pub fn position_taskbar_window(hwnd: isize, x: i32, y: i32, width: i32, height: i32) -> Result<()> {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SetWindowPos, HWND_TOPMOST, SWP_NOACTIVATE, SWP_SHOWWINDOW,
+        };
+
+        unsafe {
+            SetWindowPos(
+                HWND(hwnd as _),
+                HWND_TOPMOST,
+                x,
+                y,
+                width,
+                height,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            )
+            .map_err(|e| {
+                AsterError::Platform(format!(
+                    "position_taskbar_window SetWindowPos failed: {}",
+                    e
+                ))
+            })?;
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = (hwnd, x, y, width, height);
+    }
+
+    Ok(())
+}
+
+/// Applies native Win32 window styles, DWM Mica backdrop, and primary-monitor positioning.
+pub fn apply_native_taskbar_configuration(hwnd: isize) -> Result<(u32, u32)> {
+    // 1. DWM Immersive Dark Mode and Mica backdrop with fallback
+    if let Err(e) = apply_dark_mode_and_backdrop(hwnd, DwmBackdropType::Mica) {
+        tracing::warn!(error = %e, "DWM Mica application returned fallback");
+    }
+
+    // 2. Configure native styles: WS_POPUP, WS_EX_TOPMOST, WS_EX_TOOLWINDOW, WS_EX_NOACTIVATE, !WS_EX_APPWINDOW
+    let (style, ex_style) = configure_taskbar_native_styles(hwnd)?;
+
+    // 3. Query DPI and calculate centered top coordinates on primary monitor
+    let dpi = get_window_dpi(hwnd);
+    if let Ok((x, y, phys_w, phys_h)) = calculate_taskbar_coordinates_with_dpi(720, 48, dpi) {
+        if let Err(e) = position_taskbar_window(hwnd, x, y, phys_w, phys_h) {
+            tracing::warn!(error = %e, "Failed to position taskbar window");
+        }
+    }
+
+    Ok((style, ex_style))
 }

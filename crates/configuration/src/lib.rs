@@ -92,8 +92,14 @@ impl Default for SearchConfig {
     }
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskbarConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     pub position: String,
     pub auto_hide: bool,
     pub live_thumbnails: bool,
@@ -102,6 +108,7 @@ pub struct TaskbarConfig {
 impl Default for TaskbarConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             position: "bottom".into(),
             auto_hide: false,
             live_thumbnails: true,

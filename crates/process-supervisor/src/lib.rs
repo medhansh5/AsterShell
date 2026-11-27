@@ -2,30 +2,47 @@
 
 use astercore::{AsterError, ComponentId, ProcessStatus, RestartPolicy, Result};
 use platform_windows::JobObject;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
+/// Role assigned to an authenticated IPC client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientRole {
+    /// Supervised child process (e.g. Taskbar, Search UI). Cannot execute administrative actions like host shutdown.
+    SupervisedChild,
+    /// Administrative controller (e.g. host CLI, test runner). Authorized for lifecycle administration.
+    AdminController,
+}
+
 /// Thread-safe registry of authorized supervised process IDs for mutual authentication.
 #[derive(Debug, Clone)]
 pub struct SupervisedPidRegistry {
-    authorized_pids: Arc<RwLock<HashSet<u32>>>,
+    authorized_pids: Arc<RwLock<HashMap<u32, ClientRole>>>,
     strict: bool,
 }
 
 impl SupervisedPidRegistry {
     pub fn new(strict: bool) -> Self {
         Self {
-            authorized_pids: Arc::new(RwLock::new(HashSet::new())),
+            authorized_pids: Arc::new(RwLock::new(HashMap::new())),
             strict,
         }
     }
 
     pub fn authorize(&self, pid: u32) {
+        self.authorize_with_role(pid, ClientRole::SupervisedChild);
+    }
+
+    pub fn authorize_admin(&self, pid: u32) {
+        self.authorize_with_role(pid, ClientRole::AdminController);
+    }
+
+    pub fn authorize_with_role(&self, pid: u32, role: ClientRole) {
         if pid != 0 {
             if let Ok(mut lock) = self.authorized_pids.write() {
-                lock.insert(pid);
+                lock.insert(pid, role);
             }
         }
     }
@@ -41,10 +58,22 @@ impl SupervisedPidRegistry {
             return true;
         }
         if let Ok(lock) = self.authorized_pids.read() {
-            lock.contains(&pid)
+            lock.contains_key(&pid)
         } else {
             false
         }
+    }
+
+    pub fn get_role(&self, pid: u32) -> Option<ClientRole> {
+        if let Ok(lock) = self.authorized_pids.read() {
+            lock.get(&pid).copied()
+        } else {
+            None
+        }
+    }
+
+    pub fn is_admin(&self, pid: u32) -> bool {
+        self.get_role(pid) == Some(ClientRole::AdminController)
     }
 
     pub fn len(&self) -> usize {
@@ -302,35 +331,51 @@ impl ProcessSupervisor {
     }
 
     /// Gracefully terminates all supervised child processes within a given timeout.
+    /// Gives child processes a bounded grace period to exit cleanly (e.g. on IPC pipe disconnection);
+    /// forcibly terminates with `start_kill` as a fallback if still running after timeout.
     pub async fn shutdown_all(&mut self, timeout: Duration) -> Result<()> {
         tracing::info!("Initiating supervisor graceful shutdown...");
         let start = Instant::now();
 
-        for (&id, managed) in self.processes.iter_mut() {
-            if let Some(mut child) = managed.child.take() {
-                if let Some(pid) = child.id() {
-                    self.pid_registry.deauthorize(pid);
-                }
-                tracing::debug!(process = id.as_str(), "Terminating child process");
-                let _ = child.start_kill();
-            }
-            managed.status = ProcessStatus::Stopped;
-        }
-
+        // Phase 1: Wait bounded grace period for children to exit cleanly
         while start.elapsed() < timeout {
-            tokio::time::sleep(Duration::from_millis(50)).await;
             let mut any_alive = false;
             for managed in self.processes.values_mut() {
                 if let Some(ref mut child) = managed.child {
-                    if let Ok(None) = child.try_wait() {
-                        any_alive = true;
-                        break;
+                    match child.try_wait() {
+                        Ok(Some(_status)) => {
+                            if let Some(pid) = child.id() {
+                                self.pid_registry.deauthorize(pid);
+                            }
+                            managed.child = None;
+                            managed.status = ProcessStatus::Stopped;
+                        }
+                        Ok(None) => {
+                            any_alive = true;
+                        }
+                        Err(_) => {}
                     }
                 }
             }
             if !any_alive {
                 break;
             }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // Phase 2: For any child still running after the grace period, forcibly terminate as fallback
+        for (&id, managed) in self.processes.iter_mut() {
+            if let Some(mut child) = managed.child.take() {
+                if let Some(pid) = child.id() {
+                    self.pid_registry.deauthorize(pid);
+                }
+                tracing::warn!(
+                    process = id.as_str(),
+                    "Child process did not exit within grace period; forcibly terminating"
+                );
+                let _ = child.start_kill();
+            }
+            managed.status = ProcessStatus::Stopped;
         }
 
         tracing::info!("Supervisor shutdown completed.");
@@ -341,8 +386,33 @@ impl ProcessSupervisor {
         self.processes.get(&id).map(|p| p.status)
     }
 
+    pub fn spec(&self, id: ComponentId) -> Option<&ProcessSpec> {
+        self.processes.get(&id).map(|p| &p.spec)
+    }
+
     pub fn job_object(&self) -> &JobObject {
         &self.job_object
+    }
+
+    /// Consumes the supervisor and returns the underlying JobObject.
+    pub fn into_job_object(self) -> JobObject {
+        self.job_object
+    }
+
+    /// Queries the OS via the Win32 `IsProcessInJob` API to verify whether the specified
+    /// managed child process is currently assigned to this supervisor's Windows Job Object.
+    pub fn is_child_in_job(&self, id: ComponentId) -> Result<bool> {
+        if let Some(managed) = self.processes.get(&id) {
+            if let Some(ref child) = managed.child {
+                #[cfg(windows)]
+                if let Some(raw_h) = child.raw_handle() {
+                    return self.job_object.contains_process_handle(raw_h as _);
+                }
+                #[cfg(not(windows))]
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 }
 
@@ -451,5 +521,15 @@ mod tests {
 
         let non_strict = SupervisedPidRegistry::new(false);
         assert!(non_strict.is_authorized(99999));
+
+        // Test role authorization
+        let role_reg = SupervisedPidRegistry::new(true);
+        role_reg.authorize(100);
+        assert_eq!(role_reg.get_role(100), Some(ClientRole::SupervisedChild));
+        assert!(!role_reg.is_admin(100));
+
+        role_reg.authorize_admin(200);
+        assert_eq!(role_reg.get_role(200), Some(ClientRole::AdminController));
+        assert!(role_reg.is_admin(200));
     }
 }

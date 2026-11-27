@@ -5,9 +5,14 @@ pub mod window;
 
 pub use hotkey::{register_global_hotkey, GlobalHotkeyHandle, HotkeyConfig, HotkeyError};
 pub use window::{
-    apply_dark_mode_and_backdrop, calculate_spotlight_coordinates,
-    calculate_spotlight_coordinates_with_dpi, get_active_monitor_work_area, get_window_dpi,
-    position_window, scale_to_physical_pixels, DwmBackdropType, Rect,
+    apply_dark_mode_and_backdrop, apply_native_taskbar_configuration,
+    calculate_spotlight_coordinates, calculate_spotlight_coordinates_with_dpi,
+    calculate_taskbar_coordinates_with_dpi, configure_taskbar_native_styles,
+    get_active_monitor_work_area, get_primary_monitor_work_area, get_window_dpi, get_window_styles,
+    position_taskbar_window, position_window, scale_to_physical_pixels, DwmBackdropType, Rect,
+    WS_CAPTION_FLAG, WS_CLIPCHILDREN_FLAG, WS_CLIPSIBLINGS_FLAG, WS_EX_APPWINDOW_FLAG,
+    WS_EX_NOACTIVATE_FLAG, WS_EX_TOOLWINDOW_FLAG, WS_EX_TOPMOST_FLAG, WS_POPUP_FLAG,
+    WS_SYSMENU_FLAG, WS_THICKFRAME_FLAG, WS_VISIBLE_FLAG,
 };
 
 use astercore::{AsterError, Result};
@@ -131,8 +136,71 @@ impl JobObject {
         Ok(())
     }
 
+    /// Checks whether the specified process is assigned to this Job Object using the Win32 `IsProcessInJob` API.
+    #[cfg(windows)]
+    pub fn is_process_in_job(&self, process_handle: HANDLE) -> Result<bool> {
+        use windows::Win32::Foundation::BOOL;
+        use windows::Win32::System::JobObjects::IsProcessInJob;
+
+        let mut in_job = BOOL(0);
+        // SAFETY: Calling IsProcessInJob with valid process and job handles.
+        let res = unsafe { IsProcessInJob(process_handle, self.handle, &mut in_job) };
+        if let Err(e) = res {
+            return Err(AsterError::Platform(format!(
+                "IsProcessInJob query failed for Job Object '{}': {}",
+                self.name, e
+            )));
+        }
+        Ok(in_job.as_bool())
+    }
+
+    /// Checks whether a process identified by raw handle pointer is assigned to this Job Object.
+    pub fn contains_process_handle(&self, raw_handle: *mut std::ffi::c_void) -> Result<bool> {
+        #[cfg(windows)]
+        {
+            use windows::Win32::Foundation::HANDLE;
+            self.is_process_in_job(HANDLE(raw_handle as _))
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = raw_handle;
+            Ok(true)
+        }
+    }
+
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Queries the OS via the Win32 `QueryInformationJobObject` API to verify whether
+    /// the `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` flag is active on the kernel Job Object.
+    #[cfg(windows)]
+    pub fn query_kill_on_close(&self) -> Result<bool> {
+        use windows::Win32::System::JobObjects::{
+            JobObjectExtendedLimitInformation, QueryInformationJobObject,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+
+        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        let mut return_length = 0u32;
+        // SAFETY: Calling QueryInformationJobObject with valid job handle and correctly sized buffer.
+        let res = unsafe {
+            QueryInformationJobObject(
+                self.handle,
+                JobObjectExtendedLimitInformation,
+                &mut info as *mut _ as _,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                Some(&mut return_length),
+            )
+        };
+        res.map_err(|e| AsterError::Platform(format!("Failed to query Job Object limits: {}", e)))?;
+        let flags = info.BasicLimitInformation.LimitFlags;
+        Ok((flags.0 & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.0) != 0)
+    }
+
+    #[cfg(not(windows))]
+    pub fn query_kill_on_close(&self) -> Result<bool> {
+        Ok(true)
     }
 }
 
@@ -398,6 +466,13 @@ mod tests {
     fn test_job_object_lifecycle() {
         let job = JobObject::create("AsterShellTestJob").expect("Failed to create JobObject");
         assert_eq!(job.name(), "AsterShellTestJob");
+        let kill_on_close = job
+            .query_kill_on_close()
+            .expect("query_kill_on_close must succeed");
+        assert!(
+            kill_on_close,
+            "JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE must be active on created job object"
+        );
     }
 
     #[test]
@@ -494,5 +569,67 @@ mod tests {
                 panic!("Unexpected error registering hotkey: {:?}", e);
             }
         }
+    }
+
+    #[test]
+    fn test_taskbar_style_flags() {
+        assert_eq!(WS_POPUP_FLAG, 0x8000_0000);
+        assert_eq!(WS_VISIBLE_FLAG, 0x1000_0000);
+        assert_eq!(WS_CLIPSIBLINGS_FLAG, 0x0400_0000);
+        assert_eq!(WS_CLIPCHILDREN_FLAG, 0x0200_0000);
+        assert_eq!(WS_EX_TOPMOST_FLAG, 0x0000_0008);
+        assert_eq!(WS_EX_TOOLWINDOW_FLAG, 0x0000_0080);
+        assert_eq!(WS_EX_NOACTIVATE_FLAG, 0x0800_0000);
+        assert_eq!(WS_EX_APPWINDOW_FLAG, 0x0004_0000);
+    }
+
+    #[test]
+    fn test_primary_monitor_work_area() {
+        let work_res = get_primary_monitor_work_area();
+        assert!(
+            work_res.is_ok(),
+            "Should retrieve primary monitor work area: {:?}",
+            work_res.err()
+        );
+        let work = work_res.unwrap();
+        assert!(work.width() > 0, "Work area width must be positive");
+        assert!(work.height() > 0, "Work area height must be positive");
+    }
+
+    #[test]
+    fn test_taskbar_coordinates_signed_math() {
+        // Test with real primary monitor
+        let coords_res = calculate_taskbar_coordinates_with_dpi(720, 48, 96);
+        assert!(coords_res.is_ok());
+        let (x, y, w, h) = coords_res.unwrap();
+        assert_eq!(w, 720);
+        assert_eq!(h, 48);
+        let work = get_primary_monitor_work_area().unwrap();
+        assert_eq!(y, work.top, "Taskbar Y must match work.top");
+        assert_eq!(
+            x,
+            work.left + (work.width() - 720) / 2,
+            "Taskbar X must be horizontally centered"
+        );
+
+        // Test DPI scaling (150% = 144 DPI)
+        let coords_144 = calculate_taskbar_coordinates_with_dpi(720, 48, 144).unwrap();
+        assert_eq!(coords_144.2, 1080); // 720 * 144 / 96 = 1080
+        assert_eq!(coords_144.3, 72); // 48 * 144 / 96 = 72
+
+        // Verify signed negative coordinate math manually
+        let negative_work = Rect {
+            left: -1920,
+            top: -1080,
+            right: 0,
+            bottom: 0,
+        };
+        assert_eq!(negative_work.width(), 1920);
+        assert_eq!(negative_work.height(), 1080);
+        let phys_w = scale_to_physical_pixels(720, 96);
+        let calc_x = negative_work.left + (negative_work.width() - phys_w) / 2;
+        let calc_y = negative_work.top;
+        assert_eq!(calc_x, -1920 + (1920 - 720) / 2); // -1320
+        assert_eq!(calc_y, -1080);
     }
 }
