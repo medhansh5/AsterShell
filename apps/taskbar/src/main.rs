@@ -1,119 +1,168 @@
 //! AsterShell Floating Companion Taskbar (`taskbar`)
 //!
-//! Milestone M3A: Native Taskbar Window Foundation & Lifecycle.
 //! Supervised floating companion window built with Slint and Win32 APIs,
 //! supporting non-activating topmost presentation, DWM Mica composition,
-//! signed physical placement at the top of the primary monitor, zero work-area
-//! contraction, and authenticated supervisor IPC lifecycle coordination.
+//! multi-monitor placement, event-driven window tracking, pinned & running
+//! app interactions, zero-polling system indicators, and keyboard navigation.
 
 use astercore::{ComponentId, Result};
 use diagnostics::{init_diagnostics, DiagnosticConfig};
 use ipc::{
     transport, IpcRequest, IpcResponse, RequestEnvelope, ResponseEnvelope, PROTOCOL_VERSION_1,
 };
-use platform_windows::default_pipe_address;
-use slint::ComponentHandle;
+use platform_windows::{
+    default_pipe_address, register_global_hotkey, AudioMonitorHandle, HotkeyConfig,
+    NetworkMonitorHandle, PowerMonitorHandle,
+};
+use slint::{ComponentHandle, ModelRc, VecModel};
 use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use window_tracker::WindowInfo;
 
 slint::slint! {
     #[edition = "1.19"]
+    export { TaskbarWindow, TaskbarAppItem } from "ui/taskbar.slint";
+}
 
-    export component TaskbarWindow inherits Window {
-        title: "AsterShell Taskbar";
-        preferred-width: 720px;
-        preferred-height: 48px;
-        min-width: 720px;
-        max-width: 720px;
-        min-height: 48px;
-        max-height: 48px;
-        background: transparent;
-        no-frame: true;
+#[derive(Debug, Clone)]
+struct PinnedApp {
+    process_key: &'static str,
+    title: &'static str,
+    monogram: &'static str,
+    launch_target: &'static str,
+}
 
-        in-out property <string> status_text: "✦ AsterShell • Floating Companion";
-        in-out property <string> mode_badge: "M3A FOUNDATION";
+const DEFAULT_PINNED_APPS: &[PinnedApp] = &[
+    PinnedApp {
+        process_key: "explorer",
+        title: "File Explorer",
+        monogram: "FE",
+        launch_target: "explorer.exe",
+    },
+    PinnedApp {
+        process_key: "windowsterminal",
+        title: "Terminal",
+        monogram: "WT",
+        launch_target: "wt.exe",
+    },
+    PinnedApp {
+        process_key: "msedge",
+        title: "Edge",
+        monogram: "ED",
+        launch_target: "msedge.exe",
+    },
+    PinnedApp {
+        process_key: "notepad",
+        title: "Notepad",
+        monogram: "NP",
+        launch_target: "notepad.exe",
+    },
+];
 
-        callback action_clicked();
+fn make_monogram(name: &str) -> String {
+    let clean: String = name.chars().filter(|c| c.is_alphanumeric()).collect();
+    let mut chars = clean.chars();
+    match (chars.next(), chars.next()) {
+        (Some(a), Some(b)) => format!("{}{}", a.to_ascii_uppercase(), b.to_ascii_uppercase()),
+        (Some(a), None) => a.to_ascii_uppercase().to_string(),
+        _ => "AP".to_string(),
+    }
+}
 
-        // Main floating companion capsule
-        Rectangle {
-            width: 100%;
-            height: 100%;
-            border-radius: 14px;
-            background: rgba(20, 20, 26, 0.94);
-            border-width: 1px;
-            border-color: rgba(255, 255, 255, 0.12);
+/// Builds the combined list of pinned apps and live running windows for the taskbar strip.
+pub fn build_taskbar_app_items(windows: &[WindowInfo]) -> Vec<TaskbarAppItem> {
+    let mut items = Vec::new();
+    let mut matched_hwnds = std::collections::HashSet::new();
 
-            HorizontalLayout {
-                padding-left: 16px;
-                padding-right: 16px;
-                spacing: 12px;
-                alignment: center;
+    for pinned in DEFAULT_PINNED_APPS {
+        let matching_win = windows.iter().find(|w| {
+            w.process_name.eq_ignore_ascii_case(pinned.process_key)
+                && !matched_hwnds.contains(&w.hwnd)
+        });
 
-                // Brand Pill / Launcher indicator
-                HorizontalLayout {
-                    spacing: 8px;
-                    alignment: center;
-
-                    Text {
-                        text: "✦";
-                        font-size: 15px;
-                        color: #60a5fa;
-                        vertical-alignment: center;
-                    }
-
-                    Text {
-                        text: "AsterTaskbar";
-                        font-size: 13px;
-                        font-weight: 700;
-                        color: #f4f4f6;
-                        vertical-alignment: center;
-                    }
-                }
-
-                // Vertical Divider
-                Rectangle {
-                    width: 1px;
-                    height: 20px;
-                    background: rgba(255, 255, 255, 0.15);
-                }
-
-                // Status Message / Companion Mode
-                Text {
-                    text <=> root.status_text;
-                    font-size: 12px;
-                    color: #94a3b8;
-                    horizontal-stretch: 1;
-                    vertical-alignment: center;
-                    overflow: elide;
-                }
-
-                // Mode Badge
-                Rectangle {
-                    border-radius: 6px;
-                    background: rgba(59, 130, 246, 0.18);
-                    border-width: 1px;
-                    border-color: rgba(59, 130, 246, 0.40);
-                    height: 24px;
-
-                    HorizontalLayout {
-                        padding-left: 8px;
-                        padding-right: 8px;
-                        alignment: center;
-
-                        Text {
-                            text <=> root.mode_badge;
-                            font-size: 10px;
-                            font-weight: 600;
-                            color: #93c5fd;
-                            vertical-alignment: center;
-                        }
-                    }
-                }
-            }
+        if let Some(w) = matching_win {
+            matched_hwnds.insert(w.hwnd);
+            items.push(TaskbarAppItem {
+                hwnd: w.hwnd as i32,
+                title: w.title.clone().into(),
+                monogram: pinned.monogram.into(),
+                is_focused: w.is_focused,
+                is_minimized: w.is_minimized,
+                is_pinned: true,
+                launch_target: if w.executable_path.is_empty() {
+                    pinned.launch_target.into()
+                } else {
+                    w.executable_path.clone().into()
+                },
+            });
+        } else {
+            items.push(TaskbarAppItem {
+                hwnd: 0,
+                title: pinned.title.into(),
+                monogram: pinned.monogram.into(),
+                is_focused: false,
+                is_minimized: false,
+                is_pinned: true,
+                launch_target: pinned.launch_target.into(),
+            });
         }
+    }
+
+    for w in windows {
+        if matched_hwnds.contains(&w.hwnd) {
+            continue;
+        }
+        let label = if !w.process_name.is_empty() {
+            &w.process_name
+        } else {
+            &w.title
+        };
+        items.push(TaskbarAppItem {
+            hwnd: w.hwnd as i32,
+            title: w.title.clone().into(),
+            monogram: make_monogram(label).into(),
+            is_focused: w.is_focused,
+            is_minimized: w.is_minimized,
+            is_pinned: false,
+            launch_target: w.executable_path.clone().into(),
+        });
+    }
+
+    items
+}
+
+/// Formats local wall-clock time (`HH:MM`), date (`DD MMM`), and returns seconds until next minute boundary.
+pub fn format_local_clock() -> (String, String, u64) {
+    #[cfg(windows)]
+    {
+        use windows::Win32::System::SystemInformation::GetLocalTime;
+        let st = unsafe { GetLocalTime() };
+        let month_name = match st.wMonth {
+            1 => "Jan",
+            2 => "Feb",
+            3 => "Mar",
+            4 => "Apr",
+            5 => "May",
+            6 => "Jun",
+            7 => "Jul",
+            8 => "Aug",
+            9 => "Sep",
+            10 => "Oct",
+            11 => "Nov",
+            12 => "Dec",
+            _ => "",
+        };
+        let time_str = format!("{:02}:{:02}", st.wHour, st.wMinute);
+        let date_str = format!("{} {}", st.wDay, month_name);
+        let secs_remaining = (60u64).saturating_sub(st.wSecond as u64).max(1);
+        (time_str, date_str, secs_remaining)
+    }
+
+    #[cfg(not(windows))]
+    {
+        ("12:00".to_string(), "Today".to_string(), 60)
     }
 }
 
@@ -135,7 +184,6 @@ pub fn apply_taskbar_native_styles(win: &TaskbarWindow, monitor_target: &str) ->
         .flatten();
 
     if let Some(hwnd) = hwnd_opt {
-        // 1. DWM Immersive Dark Mode and Mica backdrop
         if let Err(e) = platform_windows::apply_dark_mode_and_backdrop(
             hwnd,
             platform_windows::DwmBackdropType::Mica,
@@ -143,12 +191,10 @@ pub fn apply_taskbar_native_styles(win: &TaskbarWindow, monitor_target: &str) ->
             tracing::warn!(error = %e, "DWM Mica application returned fallback");
         }
 
-        // 2. Configure native styles: WS_POPUP, WS_EX_TOPMOST, WS_EX_TOOLWINDOW, WS_EX_NOACTIVATE, !WS_EX_APPWINDOW
         if let Err(e) = platform_windows::configure_taskbar_native_styles(hwnd) {
             tracing::warn!(error = %e, "Failed to configure native taskbar window styles");
         }
 
-        // 3. Position on target monitor
         if let Err(e) =
             platform_windows::reposition_taskbar_on_monitor(hwnd, monitor_target, 720, 48)
         {
@@ -159,7 +205,6 @@ pub fn apply_taskbar_native_styles(win: &TaskbarWindow, monitor_target: &str) ->
             );
         }
 
-        // 4. Install display change subclass for dynamic repositioning on WM_DISPLAYCHANGE / WM_DPICHANGED
         if let Err(e) =
             platform_windows::install_display_change_subclass(hwnd, monitor_target, 720, 48)
         {
@@ -168,6 +213,27 @@ pub fn apply_taskbar_native_styles(win: &TaskbarWindow, monitor_target: &str) ->
     }
 
     hwnd_opt
+}
+
+fn launch_app_target(target: &str) {
+    if target.trim().is_empty() {
+        return;
+    }
+    let launch = if target.contains(':') && !target.contains('\\') {
+        shell_api::LaunchTarget::Uri {
+            uri: target.to_string(),
+        }
+    } else {
+        shell_api::LaunchTarget::Executable {
+            path: target.to_string(),
+            arguments: Vec::new(),
+            working_directory: None,
+        }
+    };
+
+    if let Err(e) = shell_api::launch_target(&launch) {
+        tracing::warn!(target, error = %e, "Failed to launch taskbar app target");
+    }
 }
 
 /// Manages the supervisor connection lifecycle with bounded exponential backoff retry and reconnection.
@@ -185,7 +251,7 @@ pub async fn run_supervisor_connection_loop(
 
         match transport::connect_pipe_client(&pipe_address).await {
             Ok(mut client) => {
-                attempt = 0; // Reset backoff upon successful transport connection
+                attempt = 0;
                 let handshake_req = RequestEnvelope {
                     request_id: 1,
                     request: IpcRequest::Handshake {
@@ -206,7 +272,6 @@ pub async fn run_supervisor_connection_loop(
                                 "Taskbar supervisor mutual handshake confirmed; entering supervised lifecycle"
                             );
 
-                            // Active connection loop: wait for supervisor shutdown notice or connection drop
                             loop {
                                 tokio::select! {
                                     _ = shutdown_notify.notified() => {
@@ -227,7 +292,7 @@ pub async fn run_supervisor_connection_loop(
                                             }
                                             Err(e) => {
                                                 tracing::info!(error = %e, "Supervisor connection dropped; entering reconnection lifecycle");
-                                                break; // Breaks inner loop to trigger reconnection
+                                                break;
                                             }
                                         }
                                     }
@@ -256,20 +321,13 @@ pub async fn run_supervisor_connection_loop(
             break;
         }
 
-        // Calculate bounded exponential backoff with jitter
         attempt = attempt.saturating_add(1);
         let backoff_multiplier = 2u64.pow(attempt.min(5));
         let jitter_ms = (std::process::id() as u64).wrapping_mul(attempt as u64) % 50;
         let delay = (initial_backoff * backoff_multiplier as u32
             + Duration::from_millis(jitter_ms))
         .min(max_backoff);
-        tracing::debug!(
-            delay_ms = delay.as_millis(),
-            attempt,
-            "Waiting before supervisor reconnect attempt"
-        );
 
-        // Interruptible retry delay
         tokio::select! {
             _ = shutdown_notify.notified() => {
                 tracing::debug!("Shutdown notification interrupted reconnect backoff");
@@ -287,7 +345,7 @@ async fn main() -> Result<()> {
         default_level: "info",
     });
 
-    tracing::info!("AsterShell Taskbar (M3A Foundation) initializing...");
+    tracing::info!("AsterShell Taskbar initializing...");
 
     let args: Vec<String> = env::args().collect();
     let mut supervisor_pipe = default_pipe_address();
@@ -321,7 +379,6 @@ async fn main() -> Result<()> {
         .unwrap_or_default();
     let monitor_target = cli_monitor.unwrap_or(config.taskbar.monitor);
 
-    // In test-child mode, connect to supervisor IPC, acknowledge handshake, and wait for shutdown/pipe break
     if is_test_child {
         tracing::info!(
             supervisor_pipe = %supervisor_pipe,
@@ -366,11 +423,8 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
-            } else {
-                tracing::warn!("Test-child failed to connect to supervisor pipe");
             }
         } else {
-            // Standalone test-child loop: stays alive in sleep loop until OS or Job Object terminates it (LIFECYCLE-01)
             loop {
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
@@ -382,7 +436,6 @@ async fn main() -> Result<()> {
     let is_running = Arc::new(AtomicBool::new(true));
     let shutdown_notify = Arc::new(tokio::sync::Notify::new());
 
-    // 1. Connect to ShellHost Supervisor via Named Pipe with reconnection (AC-M3A-01, SEC-01, INTEGRATION-01)
     if connect_supervisor {
         let is_running_sup = is_running.clone();
         let shutdown_notify_sup = shutdown_notify.clone();
@@ -392,7 +445,6 @@ async fn main() -> Result<()> {
         });
     }
 
-    // 2. Handle Ctrl+C signal
     {
         let is_running_ctrl = is_running.clone();
         let shutdown_notify_ctrl = shutdown_notify.clone();
@@ -408,16 +460,194 @@ async fn main() -> Result<()> {
         });
     }
 
-    // 3. Instantiate and configure Slint Window
     let main_window = TaskbarWindow::new().map_err(|e| {
         astercore::AsterError::Platform(format!("Failed to create TaskbarWindow: {}", e))
     })?;
+
+    // Wire UI Interaction Callbacks (M3E)
+    main_window.on_search_clicked(|| {
+        tracing::info!("Taskbar search pill clicked");
+        launch_app_target("search-ui.exe");
+    });
+
+    main_window.on_item_clicked(|hwnd, is_focused, is_minimized, launch_target_str| {
+        if hwnd != 0 {
+            if let Err(e) = window_tracker::toggle_window(hwnd as isize, is_focused, is_minimized) {
+                tracing::warn!(hwnd, error = %e, "Failed to toggle tracked window");
+            }
+        } else {
+            launch_app_target(launch_target_str.as_str());
+        }
+    });
+
+    main_window.on_item_middle_clicked(|launch_target_str| {
+        launch_app_target(launch_target_str.as_str());
+    });
+
+    main_window.on_item_right_clicked(|hwnd, title| {
+        if hwnd != 0 {
+            tracing::info!(hwnd, title = %title, "Closing tracked window via taskbar right-click");
+            let _ = window_tracker::close_window(hwnd as isize);
+        }
+    });
+
+    main_window.on_volume_clicked(|| {
+        launch_app_target("ms-settings:sound");
+    });
+
+    main_window.on_network_clicked(|| {
+        launch_app_target("ms-settings:network");
+    });
 
     main_window.show().map_err(|e| {
         astercore::AsterError::Platform(format!("Failed to show TaskbarWindow: {}", e))
     })?;
 
-    // 4. Start WinEvent-driven WindowTracker and bridge state to TaskbarWindow
+    let hwnd_opt = apply_taskbar_native_styles(&main_window, &monitor_target);
+
+    // Register Win+Alt+T keyboard navigation hotkey (M3E)
+    let _taskbar_hotkey = {
+        let win_weak_hk = main_window.as_weak();
+        let hwnd_for_hk = hwnd_opt;
+        match register_global_hotkey(
+            HotkeyConfig {
+                alt: true,
+                ctrl: false,
+                shift: false,
+                win: true,
+                no_repeat: true,
+                vk_code: 0x54, // 'T'
+            },
+            move || {
+                let win_weak_inner = win_weak_hk.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(win) = win_weak_inner.upgrade() {
+                        win.set_selected_index(0);
+                    }
+                    if let Some(hwnd) = hwnd_for_hk {
+                        let _ = window_tracker::activate_window(hwnd);
+                    }
+                });
+            },
+        ) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                tracing::debug!(error = %e, "Win+Alt+T hotkey registration skipped");
+                None
+            }
+        }
+    };
+
+    // Start Minute-Boundary Aligned Clock Task (M3E)
+    {
+        let (init_time, init_date, _) = format_local_clock();
+        main_window.set_clock_time(init_time.into());
+        main_window.set_clock_date(init_date.into());
+
+        let win_weak_clk = main_window.as_weak();
+        let is_running_clk = is_running.clone();
+        let shutdown_clk = shutdown_notify.clone();
+        tokio::spawn(async move {
+            while is_running_clk.load(Ordering::SeqCst) {
+                let (t_str, d_str, secs_until_next) = format_local_clock();
+                let win_inner = win_weak_clk.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(win) = win_inner.upgrade() {
+                        win.set_clock_time(t_str.into());
+                        win.set_clock_date(d_str.into());
+                    }
+                });
+
+                tokio::select! {
+                    _ = shutdown_clk.notified() => break,
+                    _ = tokio::time::sleep(Duration::from_secs(secs_until_next)) => {}
+                }
+            }
+        });
+    }
+
+    // Start Event-Driven System Indicators (M3E)
+    let _audio_monitor = match AudioMonitorHandle::start() {
+        Ok((handle, rx)) => {
+            let win_weak_a = main_window.as_weak();
+            std::thread::Builder::new()
+                .name("taskbar-audio-bridge".to_string())
+                .spawn(move || {
+                    while let Ok(state) = rx.recv() {
+                        let win_inner = win_weak_a.clone();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(win) = win_inner.upgrade() {
+                                win.set_volume_text(format!("{}%", state.volume_percent).into());
+                                win.set_is_muted(state.is_muted);
+                            }
+                        });
+                    }
+                })
+                .ok();
+            Some(handle)
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "Audio monitor unavailable");
+            None
+        }
+    };
+
+    let _network_monitor = match NetworkMonitorHandle::start() {
+        Ok((handle, rx)) => {
+            let win_weak_n = main_window.as_weak();
+            std::thread::Builder::new()
+                .name("taskbar-network-bridge".to_string())
+                .spawn(move || {
+                    while let Ok(status) = rx.recv() {
+                        let win_inner = win_weak_n.clone();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(win) = win_inner.upgrade() {
+                                win.set_network_label(status.label.into());
+                                win.set_network_connected(status.is_connected);
+                            }
+                        });
+                    }
+                })
+                .ok();
+            Some(handle)
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "Network monitor unavailable");
+            None
+        }
+    };
+
+    let _power_monitor = match PowerMonitorHandle::start() {
+        Ok((handle, rx)) => {
+            let win_weak_p = main_window.as_weak();
+            std::thread::Builder::new()
+                .name("taskbar-power-bridge".to_string())
+                .spawn(move || {
+                    while let Ok(status) = rx.recv() {
+                        let win_inner = win_weak_p.clone();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(win) = win_inner.upgrade() {
+                                win.set_has_battery(status.has_battery);
+                                let text = if status.is_charging {
+                                    format!("+{}%", status.percent)
+                                } else {
+                                    format!("{}%", status.percent)
+                                };
+                                win.set_battery_text(text.into());
+                            }
+                        });
+                    }
+                })
+                .ok();
+            Some(handle)
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "Power monitor unavailable");
+            None
+        }
+    };
+
+    // Start WinEvent-driven WindowTracker and bridge model to TaskbarWindow (M3C + M3E)
     let _window_tracker = match window_tracker::WindowTracker::start() {
         Ok((tracker, rx)) => {
             let win_weak_tracker = main_window.as_weak();
@@ -427,18 +657,12 @@ async fn main() -> Result<()> {
                     let mut state = window_tracker::WindowTrackerState::new();
                     while let Ok(event) = rx.recv() {
                         state.apply_event(event);
-                        let count = state.windows.len();
-                        let focused_title = state
-                            .windows
-                            .iter()
-                            .find(|w| w.is_focused)
-                            .map(|w| w.title.clone())
-                            .unwrap_or_else(|| "Desktop".to_string());
-                        let summary = format!("{} • {} open", focused_title, count);
+                        let items = build_taskbar_app_items(&state.windows);
                         let win_weak_inner = win_weak_tracker.clone();
                         let _ = slint::invoke_from_event_loop(move || {
                             if let Some(win) = win_weak_inner.upgrade() {
-                                win.set_status_text(summary.into());
+                                let model = std::rc::Rc::new(VecModel::from(items));
+                                win.set_app_items(ModelRc::from(model));
                             }
                         });
                     }
@@ -451,9 +675,6 @@ async fn main() -> Result<()> {
             None
         }
     };
-
-    // Initial native Win32 configuration
-    apply_taskbar_native_styles(&main_window, &monitor_target);
 
     // Re-verify styles and placement on short timer once Winit message pump starts
     let win_weak = main_window.as_weak();
@@ -473,6 +694,8 @@ async fn main() -> Result<()> {
     slint::run_event_loop()
         .map_err(|e| astercore::AsterError::Platform(format!("Slint event loop error: {}", e)))?;
 
+    is_running.store(false, Ordering::SeqCst);
+    shutdown_notify.notify_waiters();
     tracing::info!("AsterShell Taskbar exited cleanly.");
     Ok(())
 }
@@ -486,6 +709,63 @@ mod tests {
         assert_eq!(ComponentId::Taskbar.as_str(), "taskbar");
     }
 
+    #[test]
+    fn test_build_taskbar_app_items_merges_pinned_and_running() {
+        let windows = vec![
+            WindowInfo {
+                hwnd: 1001,
+                title: "Windows Terminal".to_string(),
+                class_name: "CASCADIA_HOSTING_WINDOW_CLASS".to_string(),
+                pid: 4200,
+                process_name: "windowsterminal".to_string(),
+                executable_path: r"C:\wt.exe".to_string(),
+                is_minimized: false,
+                is_focused: true,
+                monitor_hmonitor: 1,
+            },
+            WindowInfo {
+                hwnd: 2002,
+                title: "Cargo Build".to_string(),
+                class_name: "ConsoleWindowClass".to_string(),
+                pid: 5100,
+                process_name: "code".to_string(),
+                executable_path: r"C:\code.exe".to_string(),
+                is_minimized: false,
+                is_focused: false,
+                monitor_hmonitor: 1,
+            },
+        ];
+
+        let items = build_taskbar_app_items(&windows);
+        // 4 default pinned + 1 unpinned running ("code") = 5
+        assert_eq!(items.len(), 5);
+
+        let wt = items
+            .iter()
+            .find(|i| i.hwnd == 1001)
+            .expect("Matched pinned WT");
+        assert!(wt.is_pinned);
+        assert!(wt.is_focused);
+        assert_eq!(wt.monogram, "WT");
+
+        let code = items
+            .iter()
+            .find(|i| i.hwnd == 2002)
+            .expect("Unpinned code");
+        assert!(!code.is_pinned);
+        assert!(!code.is_focused);
+        assert_eq!(code.monogram, "CO");
+    }
+
+    #[test]
+    fn test_format_local_clock_valid_ranges() {
+        let (time_str, date_str, secs) = format_local_clock();
+        assert_eq!(time_str.len(), 5);
+        assert!(time_str.contains(':'));
+        assert!(!date_str.is_empty());
+        assert!((1..=60).contains(&secs));
+    }
+
     #[cfg(windows)]
     #[tokio::test]
     async fn test_supervisor_connection_loop_lifecycle_and_cancellation() {
@@ -497,23 +777,19 @@ mod tests {
         let shutdown_notify_clone = shutdown_notify.clone();
         let pipe_addr = test_pipe.clone();
 
-        // 1. Start connection loop before server exists (tests initial backoff retry)
         let loop_handle = tokio::spawn(async move {
             run_supervisor_connection_loop(pipe_addr, is_running_clone, shutdown_notify_clone)
                 .await;
         });
 
-        // Allow at least one transient connection failure / backoff wait
         tokio::time::sleep(Duration::from_millis(150)).await;
 
-        // 2. Now start server and bind
         let server = transport::create_pipe_server_with_security(&test_pipe, true, None)
             .expect("create server");
 
         let server_task = tokio::spawn(async move {
             if server.connect().await.is_ok() {
                 let mut stream = server;
-                // Read handshake
                 let req_res: astercore::Result<RequestEnvelope> =
                     transport::read_framed_message(&mut stream).await;
                 if let Ok(req) = req_res {
@@ -527,7 +803,6 @@ mod tests {
                     };
                     let _ = transport::write_framed_message(&mut stream, &resp).await;
 
-                    // Send ShutdownNotice to gracefully terminate connection
                     tokio::time::sleep(Duration::from_millis(50)).await;
                     let notice = ResponseEnvelope {
                         request_id: 0,
@@ -563,7 +838,6 @@ mod tests {
                 .await;
         });
 
-        // Cancel during backoff wait
         tokio::time::sleep(Duration::from_millis(150)).await;
         is_running.store(false, Ordering::SeqCst);
         shutdown_notify.notify_waiters();

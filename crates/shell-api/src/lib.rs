@@ -3,7 +3,7 @@
 //! Provides safe, validated execution abstractions for search results and system activations.
 //! Never invokes arbitrary shell command strings or unchecked shell processes.
 
-use search_core::LaunchTarget;
+pub use search_core::LaunchTarget;
 use std::path::Path;
 use thiserror::Error;
 

@@ -1,0 +1,296 @@
+export struct TaskbarAppItem {
+    hwnd: int,
+    title: string,
+    monogram: string,
+    is_focused: bool,
+    is_minimized: bool,
+    is_pinned: bool,
+    launch_target: string,
+}
+
+export component TaskbarWindow inherits Window {
+    title: "AsterShell Taskbar";
+    preferred-width: 720px;
+    preferred-height: 48px;
+    min-width: 720px;
+    max-width: 720px;
+    min-height: 48px;
+    max-height: 48px;
+    background: transparent;
+    no-frame: true;
+
+    in-out property <[TaskbarAppItem]> app_items: [];
+    in-out property <int> selected_index: -1;
+    in-out property <string> status_text: "✦ AsterShell";
+    in-out property <string> clock_time: "00:00";
+    in-out property <string> clock_date: "Today";
+    in-out property <string> volume_text: "100%";
+    in-out property <bool> is_muted: false;
+    in-out property <string> network_label: "Online";
+    in-out property <bool> network_connected: true;
+    in-out property <bool> has_battery: false;
+    in-out property <string> battery_text: "100%";
+
+    callback search_clicked();
+    callback item_clicked(int, bool, bool, string);
+    callback item_middle_clicked(string);
+    callback item_right_clicked(int, string);
+    callback volume_clicked();
+    callback network_clicked();
+
+    FocusScope {
+        key-pressed(event) => {
+            if (event.text == Key.RightArrow) {
+                if (root.app_items.length > 0) {
+                    root.selected_index = Math.mod(root.selected_index + 1, root.app_items.length);
+                }
+                return accept;
+            }
+            if (event.text == Key.LeftArrow) {
+                if (root.app_items.length > 0) {
+                    root.selected_index = Math.mod(root.selected_index + root.app_items.length - 1, root.app_items.length);
+                }
+                return accept;
+            }
+            if (event.text == Key.Return || event.text == " ") {
+                if (root.selected_index >= 0 && root.selected_index < root.app_items.length) {
+                    root.item_clicked(
+                        root.app_items[root.selected_index].hwnd,
+                        root.app_items[root.selected_index].is_focused,
+                        root.app_items[root.selected_index].is_minimized,
+                        root.app_items[root.selected_index].launch_target
+                    );
+                }
+                return accept;
+            }
+            reject
+        }
+
+        // Main floating companion capsule
+        Rectangle {
+            width: 100%;
+            height: 100%;
+            border-radius: 14px;
+            background: rgba(20, 20, 26, 0.94);
+            border-width: 1px;
+            border-color: rgba(255, 255, 255, 0.12);
+
+            HorizontalLayout {
+                padding-left: 10px;
+                padding-right: 12px;
+                spacing: 8px;
+                alignment: space-between;
+
+                // Left: Search / Launcher Pill
+                Rectangle {
+                    width: 34px;
+                    height: 34px;
+                    border-radius: 8px;
+                    background: search_touch.has-hover ? rgba(59, 130, 246, 0.24) : rgba(59, 130, 246, 0.12);
+                    border-width: 1px;
+                    border-color: rgba(96, 165, 250, 0.35);
+
+                    Text {
+                        text: "✦";
+                        font-size: 16px;
+                        color: #60a5fa;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+
+                    search_touch := TouchArea {
+                        clicked => {
+                            root.search_clicked();
+                        }
+                    }
+                }
+
+                // Divider
+                Rectangle {
+                    width: 1px;
+                    height: 22px;
+                    background: rgba(255, 255, 255, 0.12);
+                }
+
+                // Center: Pinned & Running Application Strip
+                HorizontalLayout {
+                    spacing: 4px;
+                    horizontal-stretch: 1;
+                    alignment: start;
+
+                    for item[idx] in root.app_items: Rectangle {
+                        width: 36px;
+                        height: 36px;
+                        border-radius: 8px;
+                        background: item.is-focused
+                            ? rgba(255, 255, 255, 0.14)
+                            : (item_touch.has-hover || idx == root.selected_index)
+                                ? rgba(255, 255, 255, 0.08)
+                                : transparent;
+                        border-width: idx == root.selected_index ? 1px : 0px;
+                        border-color: rgba(96, 165, 250, 0.7);
+
+                        VerticalLayout {
+                            alignment: space-between;
+                            padding-top: 5px;
+                            padding-bottom: 3px;
+
+                            Text {
+                                text: item.monogram;
+                                font-size: 13px;
+                                font-weight: 700;
+                                color: item.is-minimized ? #94a3b8 : #f4f4f6;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+
+                            // Active indicator pill (#3b82f6) or Running dot (#9ca3af)
+                            HorizontalLayout {
+                                alignment: center;
+                                Rectangle {
+                                    height: 3px;
+                                    border-radius: 1.5px;
+                                    width: item.is-focused ? 16px : (item.hwnd != 0 ? 6px : 0px);
+                                    background: item.is-focused ? #3b82f6 : #9ca3af;
+                                }
+                            }
+                        }
+
+                        item_touch := TouchArea {
+                            pointer-event(ev) => {
+                                if (ev.kind == PointerEventKind.up) {
+                                    if (ev.button == PointerEventButton.left) {
+                                        root.item_clicked(item.hwnd, item.is-focused, item.is-minimized, item.launch_target);
+                                    } else if (ev.button == PointerEventButton.middle) {
+                                        root.item_middle_clicked(item.launch_target);
+                                    } else if (ev.button == PointerEventButton.right) {
+                                        root.item_right_clicked(item.hwnd, item.title);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if (root.app_items.length == 0): Text {
+                        text <=> root.status_text;
+                        font-size: 12px;
+                        color: #94a3b8;
+                        vertical-alignment: center;
+                    }
+                }
+
+                // Divider
+                Rectangle {
+                    width: 1px;
+                    height: 22px;
+                    background: rgba(255, 255, 255, 0.12);
+                }
+
+                // Right: System Indicators & Clock
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: end;
+
+                    // Network Indicator
+                    Rectangle {
+                        height: 28px;
+                        border-radius: 6px;
+                        background: net_touch.has-hover ? rgba(255, 255, 255, 0.08) : transparent;
+
+                        HorizontalLayout {
+                            padding-left: 6px;
+                            padding-right: 6px;
+                            spacing: 4px;
+
+                            Rectangle {
+                                width: 6px;
+                                height: 6px;
+                                border-radius: 3px;
+                                y: 11px;
+                                background: root.network_connected ? #22c55e : #ef4444;
+                            }
+
+                            Text {
+                                text <=> root.network_label;
+                                font-size: 11px;
+                                color: #cbd5e1;
+                                vertical-alignment: center;
+                            }
+                        }
+
+                        net_touch := TouchArea {
+                            clicked => {
+                                root.network_clicked();
+                            }
+                        }
+                    }
+
+                    // Audio Volume Indicator
+                    Rectangle {
+                        height: 28px;
+                        border-radius: 6px;
+                        background: vol_touch.has-hover ? rgba(255, 255, 255, 0.08) : transparent;
+
+                        HorizontalLayout {
+                            padding-left: 6px;
+                            padding-right: 6px;
+
+                            Text {
+                                text: root.is_muted ? "Muted" : root.volume_text;
+                                font-size: 11px;
+                                color: root.is_muted ? #f87171 : #cbd5e1;
+                                vertical-alignment: center;
+                            }
+                        }
+
+                        vol_touch := TouchArea {
+                            clicked => {
+                                root.volume_clicked();
+                            }
+                        }
+                    }
+
+                    // Battery / Power Indicator (shown when battery is present)
+                    if (root.has_battery): Rectangle {
+                        height: 28px;
+                        border-radius: 6px;
+                        background: rgba(255, 255, 255, 0.04);
+
+                        HorizontalLayout {
+                            padding-left: 6px;
+                            padding-right: 6px;
+
+                            Text {
+                                text <=> root.battery_text;
+                                font-size: 11px;
+                                color: #93c5fd;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+
+                    // Clock & Date
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 1px;
+
+                        Text {
+                            text <=> root.clock_time;
+                            font-size: 11px;
+                            font-weight: 700;
+                            color: #f8fafc;
+                            horizontal-alignment: right;
+                        }
+
+                        Text {
+                            text <=> root.clock_date;
+                            font-size: 9px;
+                            color: #94a3b8;
+                            horizontal-alignment: right;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
