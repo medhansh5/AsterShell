@@ -26,40 +26,7 @@ slint::slint! {
     export { TaskbarWindow, TaskbarAppItem } from "ui/taskbar.slint";
 }
 
-#[derive(Debug, Clone)]
-struct PinnedApp {
-    process_key: &'static str,
-    title: &'static str,
-    monogram: &'static str,
-    launch_target: &'static str,
-}
-
-const DEFAULT_PINNED_APPS: &[PinnedApp] = &[
-    PinnedApp {
-        process_key: "explorer",
-        title: "File Explorer",
-        monogram: "FE",
-        launch_target: "explorer.exe",
-    },
-    PinnedApp {
-        process_key: "windowsterminal",
-        title: "Terminal",
-        monogram: "WT",
-        launch_target: "wt.exe",
-    },
-    PinnedApp {
-        process_key: "msedge",
-        title: "Edge",
-        monogram: "ED",
-        launch_target: "msedge.exe",
-    },
-    PinnedApp {
-        process_key: "notepad",
-        title: "Notepad",
-        monogram: "NP",
-        launch_target: "notepad.exe",
-    },
-];
+use configuration::PinnedAppConfig;
 
 fn make_monogram(name: &str) -> String {
     let clean: String = name.chars().filter(|c| c.is_alphanumeric()).collect();
@@ -126,20 +93,27 @@ impl HwndHandleTable {
     }
 }
 
-/// Builds the combined list of pinned apps and live running windows for the taskbar strip.
+/// Builds the combined list of configured pinned apps and live running windows for the taskbar strip.
 pub fn build_taskbar_app_items(
     windows: &[WindowInfo],
+    pinned_apps: &[PinnedAppConfig],
     table: &mut HwndHandleTable,
 ) -> Vec<TaskbarAppItem> {
     table.retain_live(windows);
     let mut items = Vec::new();
     let mut matched_hwnds = std::collections::HashSet::new();
 
-    for pinned in DEFAULT_PINNED_APPS {
+    for pinned in pinned_apps {
         let matching_win = windows.iter().find(|w| {
-            w.process_name.eq_ignore_ascii_case(pinned.process_key)
+            w.process_name.eq_ignore_ascii_case(&pinned.process_key)
                 && !matched_hwnds.contains(&w.hwnd)
         });
+
+        let monogram = if pinned.monogram.trim().is_empty() {
+            make_monogram(&pinned.title)
+        } else {
+            pinned.monogram.clone()
+        };
 
         if let Some(w) = matching_win {
             matched_hwnds.insert(w.hwnd);
@@ -147,13 +121,13 @@ pub fn build_taskbar_app_items(
             items.push(TaskbarAppItem {
                 item_id,
                 title: w.title.clone().into(),
-                monogram: pinned.monogram.into(),
+                monogram: monogram.into(),
                 is_running: true,
                 is_focused: w.is_focused,
                 is_minimized: w.is_minimized,
                 is_pinned: true,
                 launch_target: if w.executable_path.is_empty() {
-                    pinned.launch_target.into()
+                    pinned.launch_target.clone().into()
                 } else {
                     w.executable_path.clone().into()
                 },
@@ -161,13 +135,13 @@ pub fn build_taskbar_app_items(
         } else {
             items.push(TaskbarAppItem {
                 item_id: 0,
-                title: pinned.title.into(),
-                monogram: pinned.monogram.into(),
+                title: pinned.title.clone().into(),
+                monogram: monogram.into(),
                 is_running: false,
                 is_focused: false,
                 is_minimized: false,
                 is_pinned: true,
-                launch_target: pinned.launch_target.into(),
+                launch_target: pinned.launch_target.clone().into(),
             });
         }
     }
@@ -573,6 +547,7 @@ async fn main() -> Result<()> {
     let config = configuration::load_config_from_path(&configuration::default_config_path())
         .unwrap_or_default();
     let monitor_target = cli_monitor.unwrap_or(config.taskbar.monitor);
+    let pinned_apps = config.taskbar.pinned_apps;
 
     if is_test_child {
         tracing::info!(
@@ -945,6 +920,7 @@ async fn main() -> Result<()> {
         Ok((tracker, rx)) => {
             let win_weak_tracker = main_window.as_weak();
             let table_bridge = hwnd_table.clone();
+            let pinned_for_bridge = pinned_apps.clone();
             std::thread::Builder::new()
                 .name("taskbar-window-bridge".to_string())
                 .spawn(move || {
@@ -952,7 +928,7 @@ async fn main() -> Result<()> {
                     while let Ok(event) = rx.recv() {
                         state.apply_event(event);
                         let items = if let Ok(mut table) = table_bridge.lock() {
-                            build_taskbar_app_items(&state.windows, &mut table)
+                            build_taskbar_app_items(&state.windows, &pinned_for_bridge, &mut table)
                         } else {
                             Vec::new()
                         };
@@ -1037,7 +1013,8 @@ mod tests {
         ];
 
         let mut table = HwndHandleTable::new();
-        let items = build_taskbar_app_items(&windows, &mut table);
+        let pins = configuration::default_pinned_apps();
+        let items = build_taskbar_app_items(&windows, &pins, &mut table);
         // 4 default pinned + 1 unpinned running ("code") = 5
         assert_eq!(items.len(), 5);
 
@@ -1074,7 +1051,8 @@ mod tests {
             monitor_hmonitor: 1,
         }];
 
-        let items = build_taskbar_app_items(&windows, &mut table);
+        let pins = configuration::default_pinned_apps();
+        let items = build_taskbar_app_items(&windows, &pins, &mut table);
         let item = items
             .iter()
             .find(|i| i.is_running)
