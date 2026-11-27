@@ -47,16 +47,16 @@
 
 ---
 
-## Milestone 3: Custom Taskbar & System Tray Integration (Current Stage — Architecture Approved)
+## Milestone 3: Custom Taskbar & System Tray Integration (Completed)
 **Objective:** Deliver AsterShell's first custom, multi-monitor taskbar (`AsterTaskbar`) and persistent system tray subsystem (`AsterTray`) in companion mode.
 
-### Planned Sub-Stages:
-- [ ] **M3A: Native Taskbar Window Foundation & Lifecycle:** Slint window creation, `WS_POPUP`, `WS_EX_TOOLWINDOW`, `WS_EX_NOACTIVATE`, DWM Mica backdrops, supervisor binding.
-- [ ] **M3B: Monitor Topology, Dynamic DPI & Positioning:** `EnumDisplayMonitors`, per-monitor taskbar instances, `WM_DISPLAYCHANGE`, Per-Monitor V2 DPI scaling.
-- [ ] **M3C: Running Application Discovery & Activation:** `crates/window-tracker` STA WinEvent hook thread, 7-stage HWND filtering, foreground window switching.
-- [ ] **M3D: AsterShell-Owned System Tray Infrastructure:** `Shell_NotifyIconW` with `NOTIFYICON_VERSION_4` and GUID identity, `TaskbarCreated` recovery, Win32 context menu.
-- [ ] **M3E: Taskbar Interactions, Clock & System Indicators:** Floating island UI layout, minute-synced clock, zero-polling CoreAudio volume, Network List Manager, battery status.
-- [ ] **M3F: Integration, Performance, Reliability & Release Audit:** End-to-end stress tests, memory/CPU profiling, GitHub Actions CI verification, exit audit.
+### Completed Sub-Stages:
+- [x] **M3A: Native Taskbar Window Foundation & Lifecycle:** Slint window creation, `WS_POPUP`, `WS_EX_TOOLWINDOW`, `WS_EX_NOACTIVATE`, DWM Mica backdrops, supervisor binding.
+- [x] **M3B: Monitor Topology, Dynamic DPI & Positioning:** `EnumDisplayMonitors`, per-monitor taskbar placement, `WM_DISPLAYCHANGE`, Per-Monitor V2 DPI scaling.
+- [x] **M3C: Running Application Discovery & Activation:** `crates/window-tracker` STA WinEvent hook thread, 7-stage HWND filtering, foreground window switching.
+- [x] **M3D: AsterShell-Owned System Tray Infrastructure:** `Shell_NotifyIconW` with `NOTIFYICON_VERSION_4` and GUID identity, `TaskbarCreated` recovery, Win32 context menu.
+- [x] **M3E: Taskbar Interactions, Clock & System Indicators:** Floating island UI layout, minute-synced clock, zero-polling CoreAudio volume, Network List Manager, battery status.
+- [x] **M3F: Integration, Performance, Reliability & Release Audit:** End-to-end stress tests, memory/CPU profiling, GitHub Actions CI verification, exit audit.
 
 ---
 
