@@ -417,6 +417,41 @@ async fn main() -> Result<()> {
         astercore::AsterError::Platform(format!("Failed to show TaskbarWindow: {}", e))
     })?;
 
+    // 4. Start WinEvent-driven WindowTracker and bridge state to TaskbarWindow
+    let _window_tracker = match window_tracker::WindowTracker::start() {
+        Ok((tracker, rx)) => {
+            let win_weak_tracker = main_window.as_weak();
+            std::thread::Builder::new()
+                .name("taskbar-window-bridge".to_string())
+                .spawn(move || {
+                    let mut state = window_tracker::WindowTrackerState::new();
+                    while let Ok(event) = rx.recv() {
+                        state.apply_event(event);
+                        let count = state.windows.len();
+                        let focused_title = state
+                            .windows
+                            .iter()
+                            .find(|w| w.is_focused)
+                            .map(|w| w.title.clone())
+                            .unwrap_or_else(|| "Desktop".to_string());
+                        let summary = format!("{} • {} open", focused_title, count);
+                        let win_weak_inner = win_weak_tracker.clone();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(win) = win_weak_inner.upgrade() {
+                                win.set_status_text(summary.into());
+                            }
+                        });
+                    }
+                })
+                .ok();
+            Some(tracker)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to start WindowTracker; continuing without window tracking");
+            None
+        }
+    };
+
     // Initial native Win32 configuration
     apply_taskbar_native_styles(&main_window, &monitor_target);
 

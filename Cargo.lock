@@ -4589,6 +4589,7 @@ dependencies = [
  "slint",
  "tokio",
  "tracing",
+ "window-tracker",
  "windows 0.58.0",
 ]
 
@@ -5556,7 +5557,10 @@ dependencies = [
 name = "window-tracker"
 version = "0.1.0"
 dependencies = [
+ "astercore",
  "thiserror 1.0.69",
+ "tracing",
+ "windows 0.58.0",
 ]
 
 [[package]]
