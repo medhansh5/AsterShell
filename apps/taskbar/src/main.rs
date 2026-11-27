@@ -71,8 +71,67 @@ fn make_monogram(name: &str) -> String {
     }
 }
 
+/// Pointer-width-safe bidirectional table mapping 32-bit Slint UI `item_id`s
+/// to full 64-bit Win32 `isize` HWND handles without truncation.
+#[derive(Debug, Default)]
+pub struct HwndHandleTable {
+    next_id: i32,
+    id_to_hwnd: std::collections::HashMap<i32, isize>,
+    hwnd_to_id: std::collections::HashMap<isize, i32>,
+}
+
+impl HwndHandleTable {
+    pub fn new() -> Self {
+        Self {
+            next_id: 1,
+            id_to_hwnd: std::collections::HashMap::new(),
+            hwnd_to_id: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Registers (or retrieves) a stable non-zero `i32` UI ID for a full pointer-width `isize` HWND.
+    pub fn register(&mut self, hwnd: isize) -> i32 {
+        if hwnd == 0 {
+            return 0;
+        }
+        if let Some(&id) = self.hwnd_to_id.get(&hwnd) {
+            return id;
+        }
+        let mut id = self.next_id;
+        if id <= 0 {
+            id = 1;
+        }
+        while self.id_to_hwnd.contains_key(&id) {
+            id = id.wrapping_add(1).max(1);
+        }
+        self.next_id = id.wrapping_add(1).max(1);
+        self.id_to_hwnd.insert(id, hwnd);
+        self.hwnd_to_id.insert(hwnd, id);
+        id
+    }
+
+    /// Resolves a Slint UI `item_id` back to its full pointer-width `isize` HWND.
+    pub fn resolve(&self, item_id: i32) -> Option<isize> {
+        if item_id <= 0 {
+            return None;
+        }
+        self.id_to_hwnd.get(&item_id).copied()
+    }
+
+    /// Prunes entries no longer present in the live tracked window list.
+    pub fn retain_live(&mut self, windows: &[WindowInfo]) {
+        let live: std::collections::HashSet<isize> = windows.iter().map(|w| w.hwnd).collect();
+        self.hwnd_to_id.retain(|hwnd, _| live.contains(hwnd));
+        self.id_to_hwnd.retain(|_, hwnd| live.contains(hwnd));
+    }
+}
+
 /// Builds the combined list of pinned apps and live running windows for the taskbar strip.
-pub fn build_taskbar_app_items(windows: &[WindowInfo]) -> Vec<TaskbarAppItem> {
+pub fn build_taskbar_app_items(
+    windows: &[WindowInfo],
+    table: &mut HwndHandleTable,
+) -> Vec<TaskbarAppItem> {
+    table.retain_live(windows);
     let mut items = Vec::new();
     let mut matched_hwnds = std::collections::HashSet::new();
 
@@ -84,10 +143,12 @@ pub fn build_taskbar_app_items(windows: &[WindowInfo]) -> Vec<TaskbarAppItem> {
 
         if let Some(w) = matching_win {
             matched_hwnds.insert(w.hwnd);
+            let item_id = table.register(w.hwnd);
             items.push(TaskbarAppItem {
-                hwnd: w.hwnd as i32,
+                item_id,
                 title: w.title.clone().into(),
                 monogram: pinned.monogram.into(),
+                is_running: true,
                 is_focused: w.is_focused,
                 is_minimized: w.is_minimized,
                 is_pinned: true,
@@ -99,9 +160,10 @@ pub fn build_taskbar_app_items(windows: &[WindowInfo]) -> Vec<TaskbarAppItem> {
             });
         } else {
             items.push(TaskbarAppItem {
-                hwnd: 0,
+                item_id: 0,
                 title: pinned.title.into(),
                 monogram: pinned.monogram.into(),
+                is_running: false,
                 is_focused: false,
                 is_minimized: false,
                 is_pinned: true,
@@ -119,10 +181,12 @@ pub fn build_taskbar_app_items(windows: &[WindowInfo]) -> Vec<TaskbarAppItem> {
         } else {
             &w.title
         };
+        let item_id = table.register(w.hwnd);
         items.push(TaskbarAppItem {
-            hwnd: w.hwnd as i32,
+            item_id,
             title: w.title.clone().into(),
             monogram: make_monogram(label).into(),
+            is_running: true,
             is_focused: w.is_focused,
             is_minimized: w.is_minimized,
             is_pinned: false,
@@ -464,32 +528,44 @@ async fn main() -> Result<()> {
         astercore::AsterError::Platform(format!("Failed to create TaskbarWindow: {}", e))
     })?;
 
+    let hwnd_table = Arc::new(std::sync::Mutex::new(HwndHandleTable::new()));
+
     // Wire UI Interaction Callbacks (M3E)
     main_window.on_search_clicked(|| {
         tracing::info!("Taskbar search pill clicked");
         launch_app_target("search-ui.exe");
     });
 
-    main_window.on_item_clicked(|hwnd, is_focused, is_minimized, launch_target_str| {
-        if hwnd != 0 {
-            if let Err(e) = window_tracker::toggle_window(hwnd as isize, is_focused, is_minimized) {
-                tracing::warn!(hwnd, error = %e, "Failed to toggle tracked window");
-            }
-        } else {
-            launch_app_target(launch_target_str.as_str());
-        }
-    });
+    {
+        let table_click = hwnd_table.clone();
+        main_window.on_item_clicked(
+            move |item_id, is_focused, is_minimized, launch_target_str| {
+                let hwnd_opt = table_click.lock().ok().and_then(|t| t.resolve(item_id));
+                if let Some(hwnd) = hwnd_opt {
+                    if let Err(e) = window_tracker::toggle_window(hwnd, is_focused, is_minimized) {
+                        tracing::warn!(hwnd, error = %e, "Failed to toggle tracked window");
+                    }
+                } else {
+                    launch_app_target(launch_target_str.as_str());
+                }
+            },
+        );
+    }
 
     main_window.on_item_middle_clicked(|launch_target_str| {
         launch_app_target(launch_target_str.as_str());
     });
 
-    main_window.on_item_right_clicked(|hwnd, title| {
-        if hwnd != 0 {
-            tracing::info!(hwnd, title = %title, "Closing tracked window via taskbar right-click");
-            let _ = window_tracker::close_window(hwnd as isize);
-        }
-    });
+    {
+        let table_rclick = hwnd_table.clone();
+        main_window.on_item_right_clicked(move |item_id, title| {
+            let hwnd_opt = table_rclick.lock().ok().and_then(|t| t.resolve(item_id));
+            if let Some(hwnd) = hwnd_opt {
+                tracing::info!(hwnd, title = %title, "Closing tracked window via taskbar right-click");
+                let _ = window_tracker::close_window(hwnd);
+            }
+        });
+    }
 
     main_window.on_volume_clicked(|| {
         launch_app_target("ms-settings:sound");
@@ -651,13 +727,18 @@ async fn main() -> Result<()> {
     let _window_tracker = match window_tracker::WindowTracker::start() {
         Ok((tracker, rx)) => {
             let win_weak_tracker = main_window.as_weak();
+            let table_bridge = hwnd_table.clone();
             std::thread::Builder::new()
                 .name("taskbar-window-bridge".to_string())
                 .spawn(move || {
                     let mut state = window_tracker::WindowTrackerState::new();
                     while let Ok(event) = rx.recv() {
                         state.apply_event(event);
-                        let items = build_taskbar_app_items(&state.windows);
+                        let items = if let Ok(mut table) = table_bridge.lock() {
+                            build_taskbar_app_items(&state.windows, &mut table)
+                        } else {
+                            Vec::new()
+                        };
                         let win_weak_inner = win_weak_tracker.clone();
                         let _ = slint::invoke_from_event_loop(move || {
                             if let Some(win) = win_weak_inner.upgrade() {
@@ -736,25 +817,54 @@ mod tests {
             },
         ];
 
-        let items = build_taskbar_app_items(&windows);
+        let mut table = HwndHandleTable::new();
+        let items = build_taskbar_app_items(&windows, &mut table);
         // 4 default pinned + 1 unpinned running ("code") = 5
         assert_eq!(items.len(), 5);
 
         let wt = items
             .iter()
-            .find(|i| i.hwnd == 1001)
+            .find(|i| i.is_running && i.monogram == "WT")
             .expect("Matched pinned WT");
         assert!(wt.is_pinned);
         assert!(wt.is_focused);
-        assert_eq!(wt.monogram, "WT");
+        assert_eq!(table.resolve(wt.item_id), Some(1001));
 
         let code = items
             .iter()
-            .find(|i| i.hwnd == 2002)
+            .find(|i| i.is_running && i.monogram == "CO")
             .expect("Unpinned code");
         assert!(!code.is_pinned);
         assert!(!code.is_focused);
-        assert_eq!(code.monogram, "CO");
+        assert_eq!(table.resolve(code.item_id), Some(2002));
+    }
+
+    #[test]
+    fn test_hwnd_pointer_width_preserved_above_i32_max() {
+        let mut table = HwndHandleTable::new();
+        let large_hwnd: isize = 0x0000_0001_8000_1234isize;
+        let windows = vec![WindowInfo {
+            hwnd: large_hwnd,
+            title: "64-bit Window".to_string(),
+            class_name: "Test64".to_string(),
+            pid: 9999,
+            process_name: "win64app".to_string(),
+            executable_path: r"C:\win64app.exe".to_string(),
+            is_minimized: false,
+            is_focused: true,
+            monitor_hmonitor: 1,
+        }];
+
+        let items = build_taskbar_app_items(&windows, &mut table);
+        let item = items
+            .iter()
+            .find(|i| i.is_running)
+            .expect("Must track 64-bit HWND window");
+        assert_eq!(
+            table.resolve(item.item_id),
+            Some(large_hwnd),
+            "Full pointer-width HWND must round-trip without i32 truncation"
+        );
     }
 
     #[test]

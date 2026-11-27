@@ -1,7 +1,8 @@
 export struct TaskbarAppItem {
-    hwnd: int,
+    item_id: int,
     title: string,
     monogram: string,
+    is_running: bool,
     is_focused: bool,
     is_minimized: bool,
     is_pinned: bool,
@@ -52,10 +53,14 @@ export component TaskbarWindow inherits Window {
                 }
                 return accept;
             }
+            if (event.text == Key.Escape) {
+                root.selected_index = -1;
+                return accept;
+            }
             if (event.text == Key.Return || event.text == " ") {
                 if (root.selected_index >= 0 && root.selected_index < root.app_items.length) {
                     root.item_clicked(
-                        root.app_items[root.selected_index].hwnd,
+                        root.app_items[root.selected_index].item_id,
                         root.app_items[root.selected_index].is_focused,
                         root.app_items[root.selected_index].is_minimized,
                         root.app_items[root.selected_index].launch_target
@@ -150,7 +155,7 @@ export component TaskbarWindow inherits Window {
                                 Rectangle {
                                     height: 3px;
                                     border-radius: 1.5px;
-                                    width: item.is-focused ? 16px : (item.hwnd != 0 ? 6px : 0px);
+                                    width: item.is-focused ? 16px : (item.is-running ? 6px : 0px);
                                     background: item.is-focused ? #3b82f6 : #9ca3af;
                                 }
                             }
@@ -160,11 +165,11 @@ export component TaskbarWindow inherits Window {
                             pointer-event(ev) => {
                                 if (ev.kind == PointerEventKind.up) {
                                     if (ev.button == PointerEventButton.left) {
-                                        root.item_clicked(item.hwnd, item.is-focused, item.is-minimized, item.launch_target);
+                                        root.item_clicked(item.item_id, item.is-focused, item.is-minimized, item.launch_target);
                                     } else if (ev.button == PointerEventButton.middle) {
                                         root.item_middle_clicked(item.launch_target);
                                     } else if (ev.button == PointerEventButton.right) {
-                                        root.item_right_clicked(item.hwnd, item.title);
+                                        root.item_right_clicked(item.item_id, item.title);
                                     }
                                 }
                             }
