@@ -157,6 +157,128 @@ pub fn find_primary_monitor() -> Result<MonitorInfo> {
         .ok_or_else(|| AsterError::Platform("No display monitors discovered on system".into()))
 }
 
+/// Interpreted target mode from `TaskbarConfig.monitor`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MonitorTargetMode {
+    Primary,
+    All,
+    Specific(String),
+}
+
+impl MonitorTargetMode {
+    pub fn parse(target: &str) -> Self {
+        let trimmed = target.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("primary") {
+            Self::Primary
+        } else if trimmed.eq_ignore_ascii_case("all") {
+            Self::All
+        } else {
+            Self::Specific(trimmed.to_string())
+        }
+    }
+}
+
+/// Result of reconciling active taskbar surfaces against current display topology.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MonitorSurfaceDiff {
+    pub to_add: Vec<MonitorInfo>,
+    pub to_keep: Vec<MonitorInfo>,
+    pub to_remove: Vec<String>,
+}
+
+/// Resolves the list of target `MonitorInfo` entries from an available monitor list.
+///
+/// - `"all"` returns every unique active monitor.
+/// - `"primary"` returns the primary monitor.
+/// - Numeric index or device name returns the matching monitor, falling back to primary if absent.
+pub fn resolve_target_monitors(target: &str, available: &[MonitorInfo]) -> Vec<MonitorInfo> {
+    if available.is_empty() {
+        return Vec::new();
+    }
+
+    let primary = available
+        .iter()
+        .find(|m| m.is_primary)
+        .cloned()
+        .unwrap_or_else(|| available[0].clone());
+
+    match MonitorTargetMode::parse(target) {
+        MonitorTargetMode::Primary => vec![primary],
+        MonitorTargetMode::All => {
+            let mut seen = std::collections::HashSet::new();
+            let mut out = Vec::new();
+            for m in available {
+                if seen.insert(m.device_name.to_ascii_lowercase()) {
+                    out.push(m.clone());
+                }
+            }
+            out
+        }
+        MonitorTargetMode::Specific(spec) => {
+            if let Ok(idx) = spec.parse::<usize>() {
+                if idx < available.len() {
+                    return vec![available[idx].clone()];
+                }
+                tracing::warn!(
+                    requested_index = idx,
+                    available_count = available.len(),
+                    "Requested monitor index out of bounds; falling back to primary"
+                );
+                return vec![primary];
+            }
+
+            if let Some(m) = available.iter().find(|m| {
+                m.device_name.eq_ignore_ascii_case(&spec)
+                    || m.device_name.to_lowercase().ends_with(&spec.to_lowercase())
+            }) {
+                return vec![m.clone()];
+            }
+
+            tracing::warn!(
+                target = %spec,
+                "Specified monitor target not found; falling back to primary monitor"
+            );
+            vec![primary]
+        }
+    }
+}
+
+/// Computes which monitor surfaces should be added, kept, or removed on topology change.
+pub fn reconcile_monitor_surfaces(
+    current_devices: &[String],
+    desired: &[MonitorInfo],
+) -> MonitorSurfaceDiff {
+    let mut to_add = Vec::new();
+    let mut to_keep = Vec::new();
+    let mut to_remove = Vec::new();
+
+    for m in desired {
+        if current_devices
+            .iter()
+            .any(|d| d.eq_ignore_ascii_case(&m.device_name))
+        {
+            to_keep.push(m.clone());
+        } else {
+            to_add.push(m.clone());
+        }
+    }
+
+    for dev in current_devices {
+        if !desired
+            .iter()
+            .any(|m| m.device_name.eq_ignore_ascii_case(dev))
+        {
+            to_remove.push(dev.clone());
+        }
+    }
+
+    MonitorSurfaceDiff {
+        to_add,
+        to_keep,
+        to_remove,
+    }
+}
+
 /// Resolves a display monitor target string to a specific `MonitorInfo`.
 ///
 /// Target format:
@@ -166,45 +288,11 @@ pub fn find_primary_monitor() -> Result<MonitorInfo> {
 ///
 /// Falls back to the primary monitor if the target cannot be matched.
 pub fn find_monitor_by_target(target: &str) -> Result<MonitorInfo> {
-    let trimmed = target.trim();
-    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("primary") {
-        return find_primary_monitor();
-    }
-
     let monitors = enumerate_monitors()?;
-    if monitors.is_empty() {
-        return Err(AsterError::Platform("No display monitors available".into()));
-    }
-
-    // Check by numerical index
-    if let Ok(idx) = trimmed.parse::<usize>() {
-        if idx < monitors.len() {
-            return Ok(monitors[idx].clone());
-        } else {
-            tracing::warn!(
-                requested_index = idx,
-                available_count = monitors.len(),
-                "Requested monitor index out of bounds; falling back to primary"
-            );
-            return find_primary_monitor();
-        }
-    }
-
-    // Check by exact or partial device name match
-    if let Some(m) = monitors.iter().find(|m| {
-        m.device_name.eq_ignore_ascii_case(trimmed)
-            || m.device_name
-                .to_lowercase()
-                .ends_with(&trimmed.to_lowercase())
-    }) {
-        return Ok(m.clone());
-    }
-
-    tracing::warn!(
-        target = trimmed,
-        "Specified monitor target not found; falling back to primary monitor"
-    );
-    find_primary_monitor()
+    resolve_target_monitors(target, &monitors)
+        .into_iter()
+        .next()
+        .ok_or_else(|| AsterError::Platform("No display monitors available".into()))
 }
 
 /// Computes the horizontal center and top placement coordinates (X, Y) and physical dimensions
@@ -599,5 +687,72 @@ mod tests {
 
         // Removing after destruction is a safe no-op (no double-free)
         assert!(!remove_display_change_subclass(hwnd.0 as isize).unwrap_or(false));
+    }
+
+    #[test]
+    fn test_all_mode_and_surface_reconciliation() {
+        let m1 = MonitorInfo {
+            hmonitor: 1,
+            device_name: r"\\.\DISPLAY1".to_string(),
+            is_primary: true,
+            monitor_rect: Rect {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1080,
+            },
+            work_rect: Rect {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1040,
+            },
+            dpi: 96,
+        };
+        let m2 = MonitorInfo {
+            hmonitor: 2,
+            device_name: r"\\.\DISPLAY2".to_string(),
+            is_primary: false,
+            monitor_rect: Rect {
+                left: 1920,
+                top: 0,
+                right: 3840,
+                bottom: 1080,
+            },
+            work_rect: Rect {
+                left: 1920,
+                top: 0,
+                right: 3840,
+                bottom: 1040,
+            },
+            dpi: 144,
+        };
+
+        // "all" returns both monitors (never silently collapses to primary)
+        let resolved_all = resolve_target_monitors("all", &[m1.clone(), m2.clone()]);
+        assert_eq!(resolved_all.len(), 2);
+        assert_eq!(resolved_all[0].device_name, r"\\.\DISPLAY1");
+        assert_eq!(resolved_all[1].device_name, r"\\.\DISPLAY2");
+
+        // Monitor addition: DISPLAY1 already active, DISPLAY2 added
+        let diff_add = reconcile_monitor_surfaces(&[r"\\.\DISPLAY1".to_string()], &resolved_all);
+        assert_eq!(diff_add.to_keep.len(), 1);
+        assert_eq!(diff_add.to_add.len(), 1);
+        assert_eq!(diff_add.to_add[0].device_name, r"\\.\DISPLAY2");
+        assert!(diff_add.to_remove.is_empty());
+
+        // Monitor removal: DISPLAY2 disconnected, falls back cleanly
+        let diff_remove = reconcile_monitor_surfaces(
+            &[r"\\.\DISPLAY1".to_string(), r"\\.\DISPLAY2".to_string()],
+            std::slice::from_ref(&m1),
+        );
+        assert_eq!(diff_remove.to_keep.len(), 1);
+        assert!(diff_remove.to_add.is_empty());
+        assert_eq!(diff_remove.to_remove, vec![r"\\.\DISPLAY2".to_string()]);
+
+        // Specific target missing falls back to primary
+        let fallback = resolve_target_monitors(r"\\.\DISPLAY2", std::slice::from_ref(&m1));
+        assert_eq!(fallback.len(), 1);
+        assert_eq!(fallback[0].device_name, r"\\.\DISPLAY1");
     }
 }

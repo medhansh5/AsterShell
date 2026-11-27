@@ -231,8 +231,13 @@ pub fn format_local_clock() -> (String, String, u64) {
 }
 
 /// Applies native Win32 window styles, DWM Mica backdrop, target-monitor positioning,
-/// and installs dynamic display change / DPI change subclass monitoring.
-pub fn apply_taskbar_native_styles(win: &TaskbarWindow, monitor_target: &str) -> Option<isize> {
+/// and optionally installs dynamic display change / DPI change subclass monitoring.
+pub fn apply_taskbar_native_styles(
+    win: &TaskbarWindow,
+    monitor_target: &str,
+    install_subclass: bool,
+    on_display_change: Option<Arc<dyn Fn() + Send + Sync>>,
+) -> Option<isize> {
     use slint::winit_030::winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use slint::winit_030::WinitWindowAccessor;
 
@@ -269,16 +274,83 @@ pub fn apply_taskbar_native_styles(win: &TaskbarWindow, monitor_target: &str) ->
             );
         }
 
-        if let Err(e) =
-            platform_windows::install_display_change_subclass(hwnd, monitor_target, 720, 48)
-        {
-            tracing::warn!(error = %e, "Failed to install display change subclass");
+        if install_subclass {
+            if let Err(e) = platform_windows::install_display_change_subclass_with_callback(
+                hwnd,
+                monitor_target,
+                720,
+                48,
+                on_display_change,
+                None,
+            ) {
+                tracing::warn!(error = %e, "Failed to install display change subclass");
+            }
         }
     }
 
     hwnd_opt
 }
 
+fn wire_taskbar_callbacks(
+    win: &TaskbarWindow,
+    hwnd_table: &Arc<std::sync::Mutex<HwndHandleTable>>,
+) {
+    win.on_search_clicked(|| {
+        tracing::info!("Taskbar search pill clicked");
+        launch_app_target(&resolve_sibling_executable("search-ui.exe"));
+    });
+
+    {
+        let table_click = hwnd_table.clone();
+        win.on_item_clicked(
+            move |item_id, is_focused, is_minimized, launch_target_str| {
+                let hwnd_opt = table_click.lock().ok().and_then(|t| t.resolve(item_id));
+                if let Some(hwnd) = hwnd_opt {
+                    if let Err(e) = window_tracker::toggle_window(hwnd, is_focused, is_minimized) {
+                        tracing::warn!(hwnd, error = %e, "Failed to toggle tracked window");
+                    }
+                } else {
+                    launch_app_target(launch_target_str.as_str());
+                }
+            },
+        );
+    }
+
+    win.on_item_middle_clicked(|launch_target_str| {
+        launch_app_target(launch_target_str.as_str());
+    });
+
+    {
+        let table_rclick = hwnd_table.clone();
+        win.on_item_right_clicked(move |item_id, title| {
+            let hwnd_opt = table_rclick.lock().ok().and_then(|t| t.resolve(item_id));
+            if let Some(hwnd) = hwnd_opt {
+                tracing::info!(hwnd, title = %title, "Closing tracked window via taskbar right-click");
+                let _ = window_tracker::close_window(hwnd);
+            }
+        });
+    }
+
+    win.on_volume_clicked(|| {
+        launch_app_target("ms-settings:sound");
+    });
+
+    win.on_network_clicked(|| {
+        launch_app_target("ms-settings:network");
+    });
+}
+
+fn resolve_sibling_executable(name: &str) -> String {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join(name);
+            if candidate.exists() {
+                return candidate.to_string_lossy().to_string();
+            }
+        }
+    }
+    name.to_string()
+}
 fn launch_app_target(target: &str) {
     if target.trim().is_empty() {
         return;
@@ -529,57 +601,110 @@ async fn main() -> Result<()> {
     })?;
 
     let hwnd_table = Arc::new(std::sync::Mutex::new(HwndHandleTable::new()));
-
-    // Wire UI Interaction Callbacks (M3E)
-    main_window.on_search_clicked(|| {
-        tracing::info!("Taskbar search pill clicked");
-        launch_app_target("search-ui.exe");
-    });
-
-    {
-        let table_click = hwnd_table.clone();
-        main_window.on_item_clicked(
-            move |item_id, is_focused, is_minimized, launch_target_str| {
-                let hwnd_opt = table_click.lock().ok().and_then(|t| t.resolve(item_id));
-                if let Some(hwnd) = hwnd_opt {
-                    if let Err(e) = window_tracker::toggle_window(hwnd, is_focused, is_minimized) {
-                        tracing::warn!(hwnd, error = %e, "Failed to toggle tracked window");
-                    }
-                } else {
-                    launch_app_target(launch_target_str.as_str());
-                }
-            },
-        );
-    }
-
-    main_window.on_item_middle_clicked(|launch_target_str| {
-        launch_app_target(launch_target_str.as_str());
-    });
-
-    {
-        let table_rclick = hwnd_table.clone();
-        main_window.on_item_right_clicked(move |item_id, title| {
-            let hwnd_opt = table_rclick.lock().ok().and_then(|t| t.resolve(item_id));
-            if let Some(hwnd) = hwnd_opt {
-                tracing::info!(hwnd, title = %title, "Closing tracked window via taskbar right-click");
-                let _ = window_tracker::close_window(hwnd);
-            }
-        });
-    }
-
-    main_window.on_volume_clicked(|| {
-        launch_app_target("ms-settings:sound");
-    });
-
-    main_window.on_network_clicked(|| {
-        launch_app_target("ms-settings:network");
-    });
+    wire_taskbar_callbacks(&main_window, &hwnd_table);
 
     main_window.show().map_err(|e| {
         astercore::AsterError::Platform(format!("Failed to show TaskbarWindow: {}", e))
     })?;
 
-    let hwnd_opt = apply_taskbar_native_styles(&main_window, &monitor_target);
+    // Track extra per-monitor TaskbarWindow instances on the Slint UI thread when monitor == "all"
+    thread_local! {
+        static EXTRA_SURFACES: std::cell::RefCell<Vec<(String, TaskbarWindow)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn apply_to_all_surfaces<F: Fn(&TaskbarWindow)>(main_win: &TaskbarWindow, f: F) {
+        f(main_win);
+        EXTRA_SURFACES.with(|cell| {
+            for (_, extra) in cell.borrow().iter() {
+                f(extra);
+            }
+        });
+    }
+
+    fn reconcile_extra_surfaces(
+        primary_device: &str,
+        monitor_target: &str,
+        hwnd_table: &Arc<std::sync::Mutex<HwndHandleTable>>,
+    ) {
+        if !matches!(
+            platform_windows::MonitorTargetMode::parse(monitor_target),
+            platform_windows::MonitorTargetMode::All
+        ) {
+            EXTRA_SURFACES.with(|cell| {
+                for (_, w) in cell.borrow_mut().drain(..) {
+                    let _ = w.hide();
+                }
+            });
+            return;
+        }
+
+        let Ok(available) = platform_windows::enumerate_monitors() else {
+            return;
+        };
+        let desired_extra: Vec<_> = platform_windows::resolve_target_monitors("all", &available)
+            .into_iter()
+            .filter(|m| !m.device_name.eq_ignore_ascii_case(primary_device))
+            .collect();
+
+        EXTRA_SURFACES.with(|cell| {
+            let mut list = cell.borrow_mut();
+            let current_names: Vec<String> = list.iter().map(|(d, _)| d.clone()).collect();
+            let diff = platform_windows::reconcile_monitor_surfaces(&current_names, &desired_extra);
+
+            // Remove surfaces for disconnected monitors
+            list.retain(|(dev, win)| {
+                let keep = !diff.to_remove.iter().any(|r| r.eq_ignore_ascii_case(dev));
+                if !keep {
+                    let _ = win.hide();
+                }
+                keep
+            });
+
+            // Reposition surviving surfaces
+            for m in &diff.to_keep {
+                if let Some((_, win)) = list
+                    .iter()
+                    .find(|(d, _)| d.eq_ignore_ascii_case(&m.device_name))
+                {
+                    apply_taskbar_native_styles(win, &m.device_name, false, None);
+                }
+            }
+
+            // Spawn new surfaces for newly attached monitors
+            for m in &diff.to_add {
+                if let Ok(extra_win) = TaskbarWindow::new() {
+                    wire_taskbar_callbacks(&extra_win, hwnd_table);
+                    if extra_win.show().is_ok() {
+                        apply_taskbar_native_styles(&extra_win, &m.device_name, false, None);
+                        list.push((m.device_name.clone(), extra_win));
+                    }
+                }
+            }
+        });
+    }
+
+    let primary_device_name = platform_windows::find_monitor_by_target(&monitor_target)
+        .map(|m| m.device_name)
+        .unwrap_or_else(|_| r"\\.\DISPLAY1".to_string());
+
+    let display_change_cb: Arc<dyn Fn() + Send + Sync> = {
+        let primary_dev = primary_device_name.clone();
+        let target_cfg = monitor_target.clone();
+        let table_dc = hwnd_table.clone();
+        Arc::new(move || {
+            let p_dev = primary_dev.clone();
+            let t_cfg = target_cfg.clone();
+            let tbl = table_dc.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                reconcile_extra_surfaces(&p_dev, &t_cfg, &tbl);
+            });
+        })
+    };
+
+    let hwnd_opt =
+        apply_taskbar_native_styles(&main_window, &monitor_target, true, Some(display_change_cb));
+    reconcile_extra_surfaces(&primary_device_name, &monitor_target, &hwnd_table);
 
     // Register Win+Alt+T keyboard navigation hotkey (M3E)
     let _taskbar_hotkey = {
@@ -629,8 +754,10 @@ async fn main() -> Result<()> {
                 let win_inner = win_weak_clk.clone();
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(win) = win_inner.upgrade() {
-                        win.set_clock_time(t_str.into());
-                        win.set_clock_date(d_str.into());
+                        apply_to_all_surfaces(&win, |s| {
+                            s.set_clock_time(t_str.clone().into());
+                            s.set_clock_date(d_str.clone().into());
+                        });
                     }
                 });
 
@@ -653,8 +780,11 @@ async fn main() -> Result<()> {
                         let win_inner = win_weak_a.clone();
                         let _ = slint::invoke_from_event_loop(move || {
                             if let Some(win) = win_inner.upgrade() {
-                                win.set_volume_text(format!("{}%", state.volume_percent).into());
-                                win.set_is_muted(state.is_muted);
+                                let vol_str = format!("{}%", state.volume_percent);
+                                apply_to_all_surfaces(&win, |s| {
+                                    s.set_volume_text(vol_str.clone().into());
+                                    s.set_is_muted(state.is_muted);
+                                });
                             }
                         });
                     }
@@ -678,8 +808,10 @@ async fn main() -> Result<()> {
                         let win_inner = win_weak_n.clone();
                         let _ = slint::invoke_from_event_loop(move || {
                             if let Some(win) = win_inner.upgrade() {
-                                win.set_network_label(status.label.into());
-                                win.set_network_connected(status.is_connected);
+                                apply_to_all_surfaces(&win, |s| {
+                                    s.set_network_label(status.label.clone().into());
+                                    s.set_network_connected(status.is_connected);
+                                });
                             }
                         });
                     }
@@ -703,13 +835,15 @@ async fn main() -> Result<()> {
                         let win_inner = win_weak_p.clone();
                         let _ = slint::invoke_from_event_loop(move || {
                             if let Some(win) = win_inner.upgrade() {
-                                win.set_has_battery(status.has_battery);
                                 let text = if status.is_charging {
                                     format!("+{}%", status.percent)
                                 } else {
                                     format!("{}%", status.percent)
                                 };
-                                win.set_battery_text(text.into());
+                                apply_to_all_surfaces(&win, |s| {
+                                    s.set_has_battery(status.has_battery);
+                                    s.set_battery_text(text.clone().into());
+                                });
                             }
                         });
                     }
@@ -742,8 +876,10 @@ async fn main() -> Result<()> {
                         let win_weak_inner = win_weak_tracker.clone();
                         let _ = slint::invoke_from_event_loop(move || {
                             if let Some(win) = win_weak_inner.upgrade() {
-                                let model = std::rc::Rc::new(VecModel::from(items));
-                                win.set_app_items(ModelRc::from(model));
+                                apply_to_all_surfaces(&win, |s| {
+                                    let model = std::rc::Rc::new(VecModel::from(items.clone()));
+                                    s.set_app_items(ModelRc::from(model));
+                                });
                             }
                         });
                     }
@@ -757,7 +893,7 @@ async fn main() -> Result<()> {
         }
     };
 
-    // Re-verify styles and placement on short timer once Winit message pump starts
+    // Re-verify styles and placement on short timer once Winit message pump starts (without re-installing subclass)
     let win_weak = main_window.as_weak();
     let target_for_timer = monitor_target.clone();
     let timer = slint::Timer::default();
@@ -766,7 +902,7 @@ async fn main() -> Result<()> {
         Duration::from_millis(50),
         move || {
             if let Some(win) = win_weak.upgrade() {
-                apply_taskbar_native_styles(&win, &target_for_timer);
+                apply_taskbar_native_styles(&win, &target_for_timer, false, None);
             }
         },
     );
