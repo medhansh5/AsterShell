@@ -201,9 +201,23 @@ pub mod transport {
 
     /// Connects a client to the Named Pipe server.
     pub async fn connect_pipe_client(pipe_name: &str) -> Result<NamedPipeClient> {
-        ClientOptions::new().open(pipe_name).map_err(|e| {
-            AsterError::Ipc(format!("Failed to connect to pipe '{}': {}", pipe_name, e))
-        })
+        let mut attempts = 0;
+        loop {
+            match ClientOptions::new().open(pipe_name) {
+                Ok(client) => return Ok(client),
+                Err(e) if e.raw_os_error() == Some(231) && attempts < 10 => {
+                    // ERROR_PIPE_BUSY: pipe instance temporarily transitioning; wait briefly
+                    attempts += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+                Err(e) => {
+                    return Err(AsterError::Ipc(format!(
+                        "Failed to connect to pipe '{}': {}",
+                        pipe_name, e
+                    )));
+                }
+            }
+        }
     }
 
     /// Reads an exact versioned frame from an async reader.

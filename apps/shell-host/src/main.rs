@@ -84,7 +84,7 @@ impl ShellHostDaemon {
             let spec = process_supervisor::ProcessSpec {
                 id: ComponentId::Taskbar,
                 executable: taskbar_exe,
-                args: vec![],
+                args: vec!["--supervisor-pipe".to_string(), self.pipe_address.clone()],
                 restart_policy: self.config.supervisor.restart_policy.clone(),
             };
             self.supervisor.register(spec);
@@ -421,7 +421,10 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test]
     async fn test_shell_host_ipc_lifecycle() {
-        let mut daemon = ShellHostDaemon::new().expect("Failed to initialize daemon");
+        let test_pipe = format!(r"\\.\pipe\astershell-test-lifecycle-{}", std::process::id());
+        let mut daemon =
+            ShellHostDaemon::new_with_pipe(&test_pipe).expect("Failed to initialize daemon");
+        daemon.config.taskbar.enabled = false;
         daemon.authorize_admin_pid(std::process::id());
         let pipe_addr = daemon.pipe_address().to_string();
 
@@ -516,6 +519,7 @@ mod tests {
         let test_pipe = format!(r"\\.\pipe\astershell-test-child-sd-{}", std::process::id());
         let mut daemon =
             ShellHostDaemon::new_with_pipe(&test_pipe).expect("Failed to initialize daemon");
+        daemon.config.taskbar.enabled = false;
         // Authorize with ordinary SupervisedChild role
         daemon.authorize_pid(std::process::id());
         let pipe_addr = daemon.pipe_address().to_string();
@@ -589,6 +593,7 @@ mod tests {
         let test_pipe = format!(r"\\.\pipe\astershell-test-sd-notice-{}", std::process::id());
         let mut daemon =
             ShellHostDaemon::new_with_pipe(&test_pipe).expect("Failed to initialize daemon");
+        daemon.config.taskbar.enabled = false;
         daemon.authorize_pid(std::process::id());
         let pipe_addr = daemon.pipe_address().to_string();
 
@@ -639,6 +644,7 @@ mod tests {
         let test_pipe = format!(r"\\.\pipe\astershell-test-unauth-{}", std::process::id());
         let mut daemon =
             ShellHostDaemon::new_with_pipe(&test_pipe).expect("Failed to initialize daemon");
+        daemon.config.taskbar.enabled = false;
         // Explicitly authorize a different PID so that std::process::id() is rejected
         daemon.authorize_pid(999999);
         let pipe_addr = daemon.pipe_address().to_string();
@@ -702,6 +708,7 @@ mod tests {
         );
         let mut daemon =
             ShellHostDaemon::new_with_pipe(&test_pipe).expect("Failed to initialize daemon");
+        daemon.config.taskbar.enabled = false;
         daemon.authorize_pid(std::process::id());
         let pipe_addr = daemon.pipe_address().to_string();
 
@@ -754,6 +761,7 @@ mod tests {
         );
         let mut daemon =
             ShellHostDaemon::new_with_pipe(&test_pipe).expect("Failed to initialize daemon");
+        daemon.config.taskbar.enabled = false;
         daemon.authorize_pid(std::process::id());
         let pipe_addr = daemon.pipe_address().to_string();
 
@@ -800,6 +808,7 @@ mod tests {
         );
         let mut daemon =
             ShellHostDaemon::new_with_pipe(&test_pipe).expect("Failed to initialize daemon");
+        daemon.config.taskbar.enabled = false;
         daemon.authorize_pid(std::process::id());
         let pipe_addr = daemon.pipe_address().to_string();
 
@@ -846,6 +855,7 @@ mod tests {
         );
         let mut daemon =
             ShellHostDaemon::new_with_pipe(&test_pipe).expect("Failed to initialize daemon");
+        daemon.config.taskbar.enabled = false;
         daemon.authorize_pid(std::process::id());
         let pipe_addr = daemon.pipe_address().to_string();
 
@@ -897,6 +907,7 @@ mod tests {
         );
         let mut daemon =
             ShellHostDaemon::new_with_pipe(&test_pipe).expect("Failed to initialize daemon");
+        daemon.config.taskbar.enabled = false;
         daemon.authorize_pid(std::process::id());
         let pipe_addr = daemon.pipe_address().to_string();
 
@@ -973,6 +984,14 @@ mod tests {
         assert!(
             daemon.supervisor().status(ComponentId::Taskbar).is_some(),
             "Taskbar must be registered when enabled in config"
+        );
+        let spec = daemon
+            .supervisor()
+            .spec(ComponentId::Taskbar)
+            .expect("Taskbar spec must exist");
+        assert!(
+            spec.args.contains(&"--supervisor-pipe".to_string()),
+            "Taskbar spec must contain --supervisor-pipe argument"
         );
     }
 

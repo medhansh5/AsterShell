@@ -386,6 +386,10 @@ impl ProcessSupervisor {
         self.processes.get(&id).map(|p| p.status)
     }
 
+    pub fn spec(&self, id: ComponentId) -> Option<&ProcessSpec> {
+        self.processes.get(&id).map(|p| &p.spec)
+    }
+
     pub fn job_object(&self) -> &JobObject {
         &self.job_object
     }
