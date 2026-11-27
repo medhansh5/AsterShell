@@ -2,6 +2,7 @@
 
 pub mod hotkey;
 pub mod monitor;
+pub mod tray;
 pub mod window;
 
 pub use hotkey::{register_global_hotkey, GlobalHotkeyHandle, HotkeyConfig, HotkeyError};
@@ -10,6 +11,7 @@ pub use monitor::{
     find_primary_monitor, install_display_change_subclass, reposition_taskbar_on_monitor,
     MonitorInfo,
 };
+pub use tray::{TrayAction, TrayIconHandle, ASTERSHELL_TRAY_GUID_U128};
 pub use window::{
     apply_dark_mode_and_backdrop, apply_native_taskbar_configuration,
     calculate_spotlight_coordinates, calculate_spotlight_coordinates_with_dpi,

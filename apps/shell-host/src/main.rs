@@ -7,7 +7,7 @@ use ipc::{
     transport::{self, NamedPipeServer},
     IpcRequest, IpcResponse, RequestEnvelope, ResponseEnvelope, PROTOCOL_VERSION_1,
 };
-use platform_windows::{default_pipe_address, JobObject};
+use platform_windows::{default_pipe_address, JobObject, TrayAction, TrayIconHandle};
 use process_supervisor::ProcessSupervisor;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -189,6 +189,38 @@ impl ShellHostDaemon {
                 }
             }
         }
+
+        // 6. Start persistent system tray icon with Explorer TaskbarCreated recovery (M3D)
+        let _tray_handle = match TrayIconHandle::start("AsterShell Companion") {
+            Ok((handle, tray_rx)) => {
+                let shutdown_tx_tray = self.shutdown_tx.clone();
+                std::thread::Builder::new()
+                    .name("shell-host-tray-events".to_string())
+                    .spawn(move || {
+                        while let Ok(action) = tray_rx.recv() {
+                            match action {
+                                TrayAction::OpenSearch => {
+                                    tracing::info!("System tray action: OpenSearch");
+                                }
+                                TrayAction::ToggleTaskbar => {
+                                    tracing::info!("System tray action: ToggleTaskbar");
+                                }
+                                TrayAction::Exit => {
+                                    tracing::info!("System tray action: Exit AsterShell requested");
+                                    let _ = shutdown_tx_tray.send(true);
+                                    break;
+                                }
+                            }
+                        }
+                    })
+                    .ok();
+                Some(handle)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to initialize system tray icon; continuing headless");
+                None
+            }
+        };
 
         // Supervisor main loop waiting for signal
         let mut shutdown_rx = self.shutdown_rx.clone();
