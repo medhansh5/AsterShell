@@ -67,8 +67,8 @@ fn test_real_slint_winit_hwnd_topmost_zorder_and_hide_restore() {
     use windows::core::w;
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DestroyWindow, GetForegroundWindow, SetForegroundWindow, WINDOW_EX_STYLE,
-        WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+        CreateWindowExW, DestroyWindow, GetForegroundWindow, SetForegroundWindow, ShowWindow,
+        SW_SHOWNA, WINDOW_EX_STYLE, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
     };
 
     // Create a normal non-topmost reference window to verify real Z-order placement.
@@ -164,7 +164,13 @@ fn test_real_slint_winit_hwnd_topmost_zorder_and_hide_restore() {
                     *had_other_fg_cb.lock().unwrap() =
                         !fg_before.0.is_null() && Some(fg_before) != own_hwnd;
 
-                    let _ = w.show();
+                    // Restore with SW_SHOWNA (not SW_SHOW) so WS_EX_NOACTIVATE is honored
+                    // even when the test process owns the foreground lock, then re-sync AlwaysOnTop.
+                    if let Some(hwnd) = own_hwnd {
+                        unsafe {
+                            let _ = ShowWindow(hwnd, SW_SHOWNA);
+                        }
+                    }
                     let _ = w.window().with_winit_window(|winit_window| {
                         winit_window.set_window_level(WindowLevel::AlwaysOnTop);
                         if let Ok(handle) = winit_window.window_handle() {
