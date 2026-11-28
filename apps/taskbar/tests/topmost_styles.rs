@@ -66,7 +66,8 @@ fn test_real_slint_winit_hwnd_topmost_zorder_and_hide_restore() {
     use windows::core::w;
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DestroyWindow, GetForegroundWindow, WINDOW_EX_STYLE, WS_POPUP, WS_VISIBLE,
+        CreateWindowExW, DestroyWindow, GetForegroundWindow, SetForegroundWindow, WINDOW_EX_STYLE,
+        WS_OVERLAPPEDWINDOW, WS_VISIBLE,
     };
 
     // Create a normal non-topmost reference window to verify real Z-order placement.
@@ -75,7 +76,7 @@ fn test_real_slint_winit_hwnd_topmost_zorder_and_hide_restore() {
             WINDOW_EX_STYLE(0),
             w!("STATIC"),
             w!("AsterNormalZOrderRef"),
-            WS_POPUP | WS_VISIBLE,
+            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
             0,
             0,
             120,
@@ -136,8 +137,11 @@ fn test_real_slint_winit_hwnd_topmost_zorder_and_hide_restore() {
                         let above = is_hwnd_above_in_zorder(hwnd, normal_hwnd);
                         *before_clone.lock().unwrap() = Some((style, ex_style, above));
 
-                        // Trigger hide
+                        // Trigger hide and give foreground to normal_hwnd before testing restore
                         let _ = w.hide();
+                        unsafe {
+                            let _ = SetForegroundWindow(normal_hwnd);
+                        }
                         *current_phase = 1;
                     }
                 }
