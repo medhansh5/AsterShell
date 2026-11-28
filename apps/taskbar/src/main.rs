@@ -288,16 +288,22 @@ pub fn apply_taskbar_native_styles(
     on_display_change: Option<Arc<dyn Fn() + Send + Sync>>,
 ) -> Option<isize> {
     use slint::winit_030::winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use slint::winit_030::winit::window::WindowLevel;
     use slint::winit_030::WinitWindowAccessor;
 
     let hwnd_opt = win
         .window()
-        .with_winit_window(|winit_window| match winit_window.window_handle() {
-            Ok(handle) => match handle.as_raw() {
-                RawWindowHandle::Win32(win32) => Some(win32.hwnd.get()),
-                _ => None,
-            },
-            Err(_) => None,
+        .with_winit_window(|winit_window| {
+            // Sync winit's internal WindowFlags::ALWAYS_ON_TOP before applying Win32 styles so
+            // subsequent winit flag updates (e.g. show/hide/decorations) never clear WS_EX_TOPMOST.
+            winit_window.set_window_level(WindowLevel::AlwaysOnTop);
+            match winit_window.window_handle() {
+                Ok(handle) => match handle.as_raw() {
+                    RawWindowHandle::Win32(win32) => Some(win32.hwnd.get()),
+                    _ => None,
+                },
+                Err(_) => None,
+            }
         })
         .flatten();
 
@@ -867,7 +873,44 @@ async fn main() -> Result<()> {
                     wire_taskbar_callbacks(&extra_win, hwnd_table);
                     if should_be_visible {
                         if extra_win.show().is_ok() {
-                            apply_taskbar_native_styles(&extra_win, &m.device_name, false, None);
+                            if apply_taskbar_native_styles(&extra_win, &m.device_name, false, None)
+                                .is_none()
+                            {
+                                let extra_weak = extra_win.as_weak();
+                                let dev_name = m.device_name.clone();
+                                let retry_timer = slint::Timer::default();
+                                let attempts = std::rc::Rc::new(std::cell::Cell::new(0u8));
+                                let timer_slot =
+                                    std::rc::Rc::new(std::cell::RefCell::new(Some(retry_timer)));
+                                let timer_slot_cb = timer_slot.clone();
+                                if let Some(t) = timer_slot.borrow().as_ref() {
+                                    t.start(
+                                        slint::TimerMode::Repeated,
+                                        Duration::from_millis(25),
+                                        move || {
+                                            let n = attempts.get().saturating_add(1);
+                                            attempts.set(n);
+                                            let done = match extra_weak.upgrade() {
+                                                Some(w) => {
+                                                    apply_taskbar_native_styles(
+                                                        &w, &dev_name, false, None,
+                                                    )
+                                                    .is_some()
+                                                        || n >= 40
+                                                }
+                                                None => true,
+                                            };
+                                            if done {
+                                                if let Some(t_inner) =
+                                                    timer_slot_cb.borrow_mut().take()
+                                                {
+                                                    t_inner.stop();
+                                                }
+                                            }
+                                        },
+                                    );
+                                };
+                            }
                             list.push((m.device_name.clone(), extra_win));
                         }
                     } else {
@@ -895,8 +938,12 @@ async fn main() -> Result<()> {
         })
     };
 
-    let hwnd_opt =
-        apply_taskbar_native_styles(&main_window, &monitor_target, true, Some(display_change_cb));
+    let _hwnd_opt = apply_taskbar_native_styles(
+        &main_window,
+        &monitor_target,
+        true,
+        Some(display_change_cb.clone()),
+    );
     reconcile_extra_surfaces(
         &primary_device_name,
         &monitor_target,
@@ -907,7 +954,6 @@ async fn main() -> Result<()> {
     // Register Win+Alt+T keyboard navigation hotkey (M3E)
     let _taskbar_hotkey = {
         let win_weak_hk = main_window.as_weak();
-        let hwnd_for_hk = hwnd_opt;
         match register_global_hotkey(
             HotkeyConfig {
                 alt: true,
@@ -920,11 +966,25 @@ async fn main() -> Result<()> {
             move || {
                 let win_weak_inner = win_weak_hk.clone();
                 let _ = slint::invoke_from_event_loop(move || {
+                    use slint::winit_030::winit::raw_window_handle::{
+                        HasWindowHandle, RawWindowHandle,
+                    };
+                    use slint::winit_030::WinitWindowAccessor;
                     if let Some(win) = win_weak_inner.upgrade() {
                         win.set_selected_index(0);
-                    }
-                    if let Some(hwnd) = hwnd_for_hk {
-                        let _ = window_tracker::activate_window(hwnd);
+                        let hwnd_opt = win
+                            .window()
+                            .with_winit_window(|w| match w.window_handle() {
+                                Ok(h) => match h.as_raw() {
+                                    RawWindowHandle::Win32(w32) => Some(w32.hwnd.get()),
+                                    _ => None,
+                                },
+                                Err(_) => None,
+                            })
+                            .flatten();
+                        if let Some(hwnd) = hwnd_opt {
+                            let _ = window_tracker::activate_window(hwnd);
+                        }
                     }
                 });
             },
@@ -1092,19 +1152,71 @@ async fn main() -> Result<()> {
         }
     };
 
-    // Re-verify styles and placement on short timer once Winit message pump starts (without re-installing subclass)
+    // Apply native styles, display-change subclass, and extra-surface styling once Winit's event
+    // loop realizes the HWND (which happens after `slint::run_event_loop()` starts), then re-verify
+    // after initial frame property sync so WS_EX_TOPMOST is never cleared by winit/Slint.
     let win_weak = main_window.as_weak();
     let target_for_timer = monitor_target.clone();
-    let timer = slint::Timer::default();
-    timer.start(
-        slint::TimerMode::SingleShot,
-        Duration::from_millis(50),
-        move || {
-            if let Some(win) = win_weak.upgrade() {
-                apply_taskbar_native_styles(&win, &target_for_timer, false, None);
-            }
-        },
-    );
+    let primary_dev_timer = primary_device_name.clone();
+    let table_timer = hwnd_table.clone();
+    let vis_timer = visibility_state.clone();
+    let display_cb_timer = display_change_cb.clone();
+    let init_attempts = std::rc::Rc::new(std::cell::Cell::new(0u8));
+    let timer_holder = std::rc::Rc::new(std::cell::RefCell::new(Some(slint::Timer::default())));
+    let timer_holder_cb = timer_holder.clone();
+    if let Some(timer) = timer_holder.borrow().as_ref() {
+        timer.start(
+            slint::TimerMode::Repeated,
+            Duration::from_millis(25),
+            move || {
+                let n = init_attempts.get().saturating_add(1);
+                init_attempts.set(n);
+                let mut realized = false;
+                if let Some(win) = win_weak.upgrade() {
+                    if apply_taskbar_native_styles(
+                        &win,
+                        &target_for_timer,
+                        true,
+                        Some(display_cb_timer.clone()),
+                    )
+                    .is_some()
+                    {
+                        realized = true;
+                        reconcile_extra_surfaces(
+                            &primary_dev_timer,
+                            &target_for_timer,
+                            &table_timer,
+                            &vis_timer,
+                        );
+                        let win_post = win.as_weak();
+                        let target_post = target_for_timer.clone();
+                        let vis_post = vis_timer.clone();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            let should_be_visible =
+                                vis_post.lock().map(|st| st.visible).unwrap_or(true);
+                            if should_be_visible {
+                                if let Some(w) = win_post.upgrade() {
+                                    apply_taskbar_native_styles(&w, &target_post, false, None);
+                                    EXTRA_SURFACES.with(|cell| {
+                                        for (dev, extra) in cell.borrow().iter() {
+                                            apply_taskbar_native_styles(extra, dev, false, None);
+                                        }
+                                    });
+                                }
+                            }
+                        });
+                    }
+                } else {
+                    realized = true;
+                }
+                if realized || n >= 40 {
+                    if let Some(t) = timer_holder_cb.borrow_mut().take() {
+                        t.stop();
+                    }
+                }
+            },
+        );
+    }
 
     tracing::info!("Starting Slint UI event loop for AsterTaskbar...");
     slint::run_event_loop()

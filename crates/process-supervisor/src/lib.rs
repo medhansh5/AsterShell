@@ -117,6 +117,7 @@ pub struct ManagedChild {
     pub crash_timestamps: Vec<Instant>,
     pub consecutive_crashes: u32,
     pub next_restart_allowed: Option<Instant>,
+    pub last_started_at: Option<Instant>,
 }
 
 impl ManagedChild {
@@ -128,12 +129,33 @@ impl ManagedChild {
             crash_timestamps: Vec::new(),
             consecutive_crashes: 0,
             next_restart_allowed: None,
+            last_started_at: None,
         }
+    }
+
+    /// Resets crash counters if the process has run continuously for at least `window_secs`.
+    pub fn reset_if_stable(&mut self, now: Instant) -> bool {
+        let window_secs = self.spec.restart_policy.window_secs;
+        if window_secs == 0 {
+            return false;
+        }
+        if let Some(started) = self.last_started_at {
+            if now.duration_since(started) >= Duration::from_secs(window_secs)
+                && (self.consecutive_crashes > 0 || !self.crash_timestamps.is_empty())
+            {
+                self.consecutive_crashes = 0;
+                self.crash_timestamps.clear();
+                return true;
+            }
+        }
+        false
     }
 
     /// Evaluates crash history against the restart policy to determine next state.
     pub fn evaluate_crash(&mut self, exit_code: Option<u32>) -> SupervisorAction {
         let now = Instant::now();
+        self.reset_if_stable(now);
+        self.last_started_at = None;
         self.consecutive_crashes += 1;
         self.crash_timestamps.push(now);
 
@@ -143,6 +165,7 @@ impl ManagedChild {
             .retain(|&t| now.duration_since(t) <= window_duration);
 
         if self.consecutive_crashes >= self.spec.restart_policy.circuit_breaker_threshold {
+            self.next_restart_allowed = None;
             self.status = ProcessStatus::CircuitBroken {
                 consecutive_crashes: self.consecutive_crashes,
             };
@@ -256,6 +279,24 @@ impl ProcessSupervisor {
             .get_mut(&id)
             .ok_or_else(|| AsterError::Supervisor(format!("Unregistered component: {:?}", id)))?;
 
+        if let Some(ref mut existing) = managed.child {
+            let existing_pid = existing.id();
+            match existing.try_wait() {
+                Ok(None) => {
+                    return Err(AsterError::Supervisor(format!(
+                        "Component {:?} is already running (pid {:?})",
+                        id, existing_pid
+                    )));
+                }
+                Ok(Some(_)) | Err(_) => {
+                    if let Some(old_pid) = existing_pid {
+                        self.pid_registry.deauthorize(old_pid);
+                    }
+                    managed.child = None;
+                }
+            }
+        }
+
         managed.status = ProcessStatus::Starting;
 
         let mut cmd = tokio::process::Command::new(&managed.spec.executable);
@@ -274,7 +315,14 @@ impl ProcessSupervisor {
 
         #[cfg(windows)]
         if let Some(raw_h) = child.raw_handle() {
-            let _ = self.job_object.assign_raw_handle(raw_h as _);
+            if let Err(e) = self.job_object.assign_raw_handle(raw_h as _) {
+                tracing::warn!(
+                    process = id.as_str(),
+                    pid,
+                    error = %e,
+                    "Failed to assign child handle to JobObject"
+                );
+            }
         }
 
         if pid != 0 {
@@ -283,6 +331,8 @@ impl ProcessSupervisor {
 
         managed.child = Some(child);
         managed.status = ProcessStatus::Running;
+        managed.last_started_at = Some(Instant::now());
+        managed.next_restart_allowed = None;
         tracing::info!(process = id.as_str(), pid, "Spawned supervised process");
         Ok(pid)
     }
@@ -293,6 +343,14 @@ impl ProcessSupervisor {
         let now = Instant::now();
 
         for (&id, managed) in self.processes.iter_mut() {
+            if matches!(
+                managed.status,
+                ProcessStatus::Stopped | ProcessStatus::CircuitBroken { .. }
+            ) && managed.child.is_none()
+            {
+                continue;
+            }
+
             // Check if backoff delay has elapsed
             if let ProcessStatus::BackoffPaused { .. } = managed.status {
                 if let Some(allowed_time) = managed.next_restart_allowed {
@@ -306,10 +364,10 @@ impl ProcessSupervisor {
 
             // Check live child status
             if let Some(ref mut child) = managed.child {
+                let child_pid = child.id();
                 match child.try_wait() {
                     Ok(Some(status)) => {
-                        let old_pid = child.id().unwrap_or(0);
-                        if old_pid != 0 {
+                        if let Some(old_pid) = child_pid {
                             self.pid_registry.deauthorize(old_pid);
                         }
                         let code = status.code().map(|c| c as u32);
@@ -318,10 +376,46 @@ impl ProcessSupervisor {
                         actions.push(action);
                     }
                     Ok(None) => {
-                        // Still running
+                        if managed.reset_if_stable(now) {
+                            tracing::info!(
+                                process = id.as_str(),
+                                "Supervised process ran stably past restart window; crash counters reset"
+                            );
+                        }
                     }
                     Err(e) => {
                         tracing::error!(process = id.as_str(), error = %e, "try_wait failed");
+                    }
+                }
+            }
+        }
+
+        actions
+    }
+
+    /// Polls all managed child processes and respawns any that require recovery.
+    pub async fn poll_and_recover(&mut self) -> Vec<SupervisorAction> {
+        let actions = self.poll_health().await;
+
+        for action in &actions {
+            if let SupervisorAction::RestartingImmediately(id) = *action {
+                match self.spawn(id) {
+                    Ok(new_pid) => {
+                        tracing::info!(
+                            process = id.as_str(),
+                            pid = new_pid,
+                            "Recovered crashed supervised process"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            process = id.as_str(),
+                            error = %e,
+                            "Failed to respawn supervised process"
+                        );
+                        if let Some(managed) = self.processes.get_mut(&id) {
+                            let _ = managed.evaluate_crash(None);
+                        }
                     }
                 }
             }
@@ -342,9 +436,10 @@ impl ProcessSupervisor {
             let mut any_alive = false;
             for managed in self.processes.values_mut() {
                 if let Some(ref mut child) = managed.child {
+                    let child_pid = child.id();
                     match child.try_wait() {
                         Ok(Some(_status)) => {
-                            if let Some(pid) = child.id() {
+                            if let Some(pid) = child_pid {
                                 self.pid_registry.deauthorize(pid);
                             }
                             managed.child = None;
@@ -531,5 +626,132 @@ mod tests {
         role_reg.authorize_admin(200);
         assert_eq!(role_reg.get_role(200), Some(ClientRole::AdminController));
         assert!(role_reg.is_admin(200));
+    }
+
+    #[test]
+    fn test_stable_runtime_resets_crash_counters() {
+        let spec = ProcessSpec {
+            id: ComponentId::Taskbar,
+            executable: PathBuf::from("dummy.exe"),
+            args: vec![],
+            restart_policy: RestartPolicy {
+                window_secs: 5,
+                circuit_breaker_threshold: 3,
+                ..Default::default()
+            },
+        };
+
+        let mut child = ManagedChild::new(spec);
+        let _ = child.evaluate_crash(Some(1));
+        let _ = child.evaluate_crash(Some(1));
+        assert_eq!(child.consecutive_crashes, 2);
+
+        // Simulate child running stably for 6 seconds (> window_secs = 5)
+        child.last_started_at = Some(Instant::now() - Duration::from_secs(6));
+        let action = child.evaluate_crash(Some(1));
+        assert_eq!(
+            action,
+            SupervisorAction::RestartingImmediately(ComponentId::Taskbar)
+        );
+        assert_eq!(
+            child.consecutive_crashes, 1,
+            "Crash counters must reset after stable runtime before counting new crash"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_spawn_rejects_duplicate_running_child() {
+        let job = JobObject::create("AsterTestDupSpawnJob").expect("JobObject::create");
+        let mut supervisor = ProcessSupervisor::new(job);
+        supervisor.register(ProcessSpec {
+            id: ComponentId::Taskbar,
+            executable: PathBuf::from("cmd.exe"),
+            args: vec!["/c".into(), "ping -n 6 127.0.0.1 >nul".into()],
+            restart_policy: RestartPolicy::default(),
+        });
+
+        let pid1 = supervisor
+            .spawn(ComponentId::Taskbar)
+            .expect("Initial spawn must succeed");
+        assert!(supervisor.is_supervised_pid(pid1));
+        assert!(supervisor.is_child_in_job(ComponentId::Taskbar).unwrap());
+
+        let dup = supervisor.spawn(ComponentId::Taskbar);
+        assert!(
+            dup.is_err(),
+            "Spawning an already-running component must be rejected to avoid duplicates"
+        );
+        assert_eq!(supervisor.child_pid(ComponentId::Taskbar), Some(pid1));
+
+        supervisor
+            .shutdown_all(Duration::from_millis(200))
+            .await
+            .expect("shutdown_all");
+        assert!(!supervisor.is_supervised_pid(pid1));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_poll_and_recover_restarts_and_trips_circuit_breaker() {
+        let job = JobObject::create("AsterTestRecoverJob").expect("JobObject::create");
+        let mut supervisor = ProcessSupervisor::new(job);
+        supervisor.register(ProcessSpec {
+            id: ComponentId::Taskbar,
+            executable: PathBuf::from("cmd.exe"),
+            args: vec!["/c".into(), "exit /b 1".into()],
+            restart_policy: RestartPolicy {
+                max_retries_in_window: 2,
+                window_secs: 10,
+                initial_backoff_ms: 50,
+                max_backoff_ms: 100,
+                circuit_breaker_threshold: 2,
+            },
+        });
+
+        let pid1 = supervisor
+            .spawn(ComponentId::Taskbar)
+            .expect("Initial spawn must succeed");
+        assert!(supervisor.is_supervised_pid(pid1));
+
+        // Wait for cmd.exe /c exit /b 1 to terminate
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let actions1 = supervisor.poll_and_recover().await;
+        assert_eq!(
+            actions1,
+            vec![SupervisorAction::RestartingImmediately(
+                ComponentId::Taskbar
+            )]
+        );
+        assert!(
+            !supervisor.is_supervised_pid(pid1),
+            "Stale PID must be deauthorized after exit"
+        );
+
+        let pid2 = supervisor
+            .child_pid(ComponentId::Taskbar)
+            .expect("Replacement child must be spawned");
+        assert_ne!(pid1, pid2);
+        assert!(
+            supervisor.is_supervised_pid(pid2),
+            "Replacement PID must be authorized"
+        );
+
+        // Wait for second crash -> should trip circuit breaker (threshold = 2)
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let actions2 = supervisor.poll_and_recover().await;
+        assert_eq!(
+            actions2,
+            vec![SupervisorAction::CircuitBroken(ComponentId::Taskbar)]
+        );
+        assert!(!supervisor.is_supervised_pid(pid2));
+        assert!(supervisor.child_pid(ComponentId::Taskbar).is_none());
+        assert_eq!(
+            supervisor.status(ComponentId::Taskbar),
+            Some(ProcessStatus::CircuitBroken {
+                consecutive_crashes: 2
+            })
+        );
     }
 }

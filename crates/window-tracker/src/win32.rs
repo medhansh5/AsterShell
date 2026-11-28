@@ -113,6 +113,16 @@ pub fn inspect_window(hwnd_raw: isize, foreground_hwnd: Option<isize>) -> Option
             return None;
         }
 
+        // Skip windows owned by the current process (matching WINEVENT_SKIPOWNPROCESS)
+        // before calling GetWindowTextW, which issues a synchronous cross-thread
+        // WM_GETTEXT SendMessage on same-process HWNDs and would deadlock if the UI
+        // thread is waiting for WindowTracker::start() before entering its event loop.
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid == std::process::id() {
+            return None;
+        }
+
         let is_visible = IsWindowVisible(hwnd).as_bool();
         let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
         let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
@@ -162,8 +172,6 @@ pub fn inspect_window(hwnd_raw: isize, foreground_hwnd: Option<isize>) -> Option
             return None;
         }
 
-        let mut pid = 0u32;
-        GetWindowThreadProcessId(hwnd, Some(&mut pid));
         let (process_name, executable_path) = query_process_executable(pid);
 
         let hmon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);

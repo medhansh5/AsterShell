@@ -225,14 +225,40 @@ impl ShellHostDaemon {
             }
         };
 
-        // Supervisor main loop waiting for signal
+        // Supervisor main loop: monitor child processes and wait for shutdown signal
         let mut shutdown_rx = self.shutdown_rx.clone();
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                tracing::info!("Ctrl+C interrupt received. Commencing graceful shutdown...");
+        let mut monitor_interval = tokio::time::interval(Duration::from_millis(250));
+        monitor_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Consume the initial immediate tick so polling starts after the first interval.
+        monitor_interval.tick().await;
+
+        loop {
+            if !self.is_running.load(Ordering::SeqCst) || *shutdown_rx.borrow() {
+                break;
             }
-            _ = shutdown_rx.changed() => {
-                tracing::info!("Shutdown signal received from IPC watch channel.");
+
+            tokio::select! {
+                biased;
+                _ = tokio::signal::ctrl_c() => {
+                    tracing::info!("Ctrl+C interrupt received. Commencing graceful shutdown...");
+                    break;
+                }
+                res = shutdown_rx.changed() => {
+                    if res.is_err() || *shutdown_rx.borrow() {
+                        tracing::info!("Shutdown signal received from IPC watch channel.");
+                        break;
+                    }
+                }
+                _ = monitor_interval.tick() => {
+                    if !self.is_running.load(Ordering::SeqCst) || *shutdown_rx.borrow() {
+                        break;
+                    }
+                    if self.config.supervisor.auto_restart_crashed_children {
+                        let _ = self.supervisor.poll_and_recover().await;
+                    } else {
+                        let _ = self.supervisor.poll_health().await;
+                    }
+                }
             }
         }
 
@@ -1125,5 +1151,55 @@ mod tests {
         dispatch_tray_action(TrayAction::Exit, &shutdown_tx, &toggle_tx, &|| Ok(()))
             .expect("Exit dispatch");
         assert!(*shutdown_rx.borrow(), "Exit must signal shutdown");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_shell_host_monitors_and_restarts_crashed_child() {
+        let test_pipe = format!(r"\\.\pipe\astershell-test-recover-{}", std::process::id());
+        let mut daemon =
+            ShellHostDaemon::new_with_pipe(&test_pipe).expect("Failed to initialize daemon");
+        // Disable default taskbar auto-registration so our custom failing spec is not overwritten
+        daemon.config.taskbar.enabled = false;
+        daemon.register_component(process_supervisor::ProcessSpec {
+            id: ComponentId::Taskbar,
+            executable: std::path::PathBuf::from("cmd.exe"),
+            args: vec!["/c".into(), "exit /b 1".into()],
+            restart_policy: astercore::RestartPolicy {
+                max_retries_in_window: 3,
+                window_secs: 10,
+                initial_backoff_ms: 50,
+                max_backoff_ms: 100,
+                circuit_breaker_threshold: 2,
+            },
+        });
+        let initial_pid = daemon
+            .spawn_component(ComponentId::Taskbar)
+            .expect("Initial component spawn");
+        let pid_registry = daemon.supervisor().pid_registry();
+        assert!(pid_registry.is_authorized(initial_pid));
+
+        let shutdown_tx = daemon.shutdown_tx.clone();
+        let daemon_task = tokio::spawn(async move {
+            let res = daemon.run().await;
+            (daemon, res)
+        });
+
+        // Allow monitor loop (250ms interval) to detect crash #1, respawn, and hit circuit breaker on crash #2
+        tokio::time::sleep(Duration::from_millis(900)).await;
+
+        assert!(
+            !pid_registry.is_authorized(initial_pid),
+            "Stale crashed PID must be deauthorized by monitor loop"
+        );
+
+        let _ = shutdown_tx.send(true);
+        let (daemon, run_res) = daemon_task.await.expect("Daemon task join");
+        assert!(run_res.is_ok(), "Daemon must exit cleanly on shutdown");
+        assert_eq!(
+            daemon.supervisor().status(ComponentId::Taskbar),
+            Some(astercore::ProcessStatus::Stopped),
+            "Shutdown must transition supervised component to Stopped"
+        );
     }
 }

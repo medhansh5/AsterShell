@@ -110,3 +110,37 @@ Verified `README.md`, `ARCHITECTURE.md`, `ROADMAP.md`, `docs/guides/{BUILD_AND_R
   - `ProcessSupervisor` is designed for persistent background daemons (`ComponentId::Taskbar`) with automatic crash-restart policies and circuit breakers.
   - `search-ui.exe` is an on-demand interactive overlay (also launched directly via `Alt+Space` or taskbar search pill) that exits or hides on `Esc`/blur. Registering it in `ProcessSupervisor` would trigger unintended restart loops whenever the user closes Spotlight.
   - **Limitation:** Because `search-ui.exe` is not bound to `shell-host`'s `JobObject`, an open `search-ui.exe` window persists if `shell-host.exe` exits, and `search-ui.exe` crashes are not auto-restarted by `shell-host`. This independent lifetime is intentional and remains P3 (non-blocking).
+
+---
+
+## 10. Live Windows Acceptance Execution Findings (`77d5df87f7db70b5798165bead19104abc88165f`)
+
+Live non-disruptive execution on **Microsoft Windows 11 Pro Build 26300 (64-bit)** (4 tests executed: Tests 1, 2, 15, 16, 17 partial; 13 interactive/hardware/soak tests `Not Tested`) uncovered one new **P1** lifecycle defect:
+
+- **`F-P1-01` (P1 — High, Blocks PR #2 Merge):** `ShellHostDaemon::run()` (`apps/shell-host/src/main.rs` lines 228–237) spawns `ComponentId::Taskbar` once at startup and then blocks on `tokio::select!` waiting only for `ctrl_c()` or `shutdown_rx.changed()`. It never polls or awaits child exit to invoke `ProcessSupervisor` crash evaluation/restart.
+  - **Evidence:** During live Test 16, terminating `taskbar.exe` (`PID 21408`) while `shell-host.exe` (`PID 21268`) was running resulted in `restarted=False` after 2 seconds (`newTbPid` empty).
+  - **Impact:** If `taskbar.exe` crashes during daily use, `shell-host.exe` stays alive in the tray without restarting the taskbar.
+  - **Recommended Remediation:** Spawn a lightweight child-monitor loop in `ShellHostDaemon::run()` (e.g., `tokio::time::interval(Duration::from_millis(500))` or `RegisterWaitForSingleObject` signal) that checks supervised child exit status via `ProcessSupervisor` and restarts crashed children according to `RestartPolicy`.
+- **Additional Observation (Test 2):** `taskbar.exe` rendered visibly (`hwnd=0x58094A`, `vis=True`, `style=0x94000000`, `ex=0x080800A0`, `WorkingArea` preserved `{0,0,1536,816}`, `FocusChanged=False`), though `WS_EX_TOPMOST` (`0x00000008`) was not reflected in the observed `exStyle` bitmask (`0x080800A0`).
+
+**Prior Acceptance Verdict:** **`REJECT — BLOCKING FINDINGS`** (until `F-P1-01` child-crash auto-restart was wired in `ShellHostDaemon::run()` and Test 16 passed live).
+
+---
+
+## 11. P1 Remediation & Live Re-Verification
+
+### Root Causes & Fixes Applied
+1. **`F-P1-01` (Supervisor Crash Recovery):**
+   - `crates/process-supervisor/src/lib.rs`: Added `last_started_at` / `reset_if_stable` stability window reset, duplicate-spawn guard, pre-`try_wait` PID capture, and `poll_and_recover()`.
+   - `apps/shell-host/src/main.rs`: Added a 250ms `biased;` `tokio::select!` child-monitoring loop in `ShellHostDaemon::run()` that invokes `poll_and_recover()` while keeping `ctrl_c()` and `shutdown_rx.changed()` responsive.
+2. **Native Window Style (`WS_EX_TOPMOST`) & Startup Deadlock:**
+   - **Discrepancy Root Cause:** `TaskbarWindow` realizes its Win32 HWND via Slint/winit only after `slint::run_event_loop()` begins; the earlier `ex=0x080800A0` reading came from `Winit Thread Event Target` rather than `AsterShell Taskbar`. In addition, `crates/window-tracker/src/win32.rs` (`inspect_window`) called `GetWindowTextW` on same-process `winit`/`NVOpenGLPbuffer` windows during `WindowTracker::start()`, causing a synchronous cross-thread `WM_GETTEXT` `SendMessage` deadlock before the Slint event loop started.
+   - `crates/platform-windows/src/window.rs` & `apps/taskbar/src/main.rs`: Synced winit `WindowLevel::AlwaysOnTop`, switched startup style application to a 25ms repeating `slint::Timer` until HWND realization (plus post-frame re-assertion), and preserved styles on restore/all-monitor surfaces.
+   - `crates/window-tracker/src/win32.rs`: Skipped own-process HWNDs (`pid == std::process::id()`) in `inspect_window` before calling `GetWindowTextW`, matching `WINEVENT_SKIPOWNPROCESS`.
+
+### Live Windows 11 Re-Verification (`target\release`)
+- **Test A (Crash Recovery):** `shell-host.exe` (`PID 9288`) spawned `taskbar.exe` (`PID 13016`); after terminating `PID 13016`, supervisor recovered `taskbar.exe` (`PID 13420`), `tbCount=1`, `recovered=True`.
+- **Test B (Job Object Shutdown):** Terminating `shell-host.exe` (`PID 9288`) resulted in `orphaned_taskbar_after_host_stop=0`.
+- **Test C (Real `TaskbarWindow` HWND Topmost & Z-Order):** `AsterShell Taskbar` (`hwnd=0x330744`) verified with `exBefore=0x08000098` (`WS_EX_TOPMOST=True`, `WS_EX_TOOLWINDOW=True`, `WS_EX_NOACTIVATE=True`, `WS_EX_APPWINDOW=False`), `above_before=True` (above Notepad); after `ShowWindow(SW_HIDE)` + `ShowWindow(SW_SHOWNA)`: `exAfter=0x08000098`, `TOPMOST_after=True`, `above_after=True`.
+
+**Updated Acceptance Verdict:** **`P1 REMEDIATION VERIFIED — MANUAL ACCEPTANCE READY FOR RETEST`** *(automated gates, regression tests, and live Tests 1/2/15/16/A/B/C pass; interactive/hardware/soak Tests 3–14 and 18 remain `Not Tested` awaiting user desktop execution).*

@@ -414,10 +414,10 @@ pub fn configure_taskbar_native_styles(hwnd: isize) -> Result<(u32, u32)> {
         use windows::Win32::Foundation::HWND;
         use windows::Win32::UI::WindowsAndMessaging::{
             GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE, GWL_STYLE,
-            HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WS_CAPTION,
-            WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-            WS_EX_TOPMOST, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
-            WS_VISIBLE,
+            HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
+            WS_CAPTION, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_APPWINDOW, WS_EX_NOACTIVATE,
+            WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU,
+            WS_THICKFRAME, WS_VISIBLE,
         };
 
         let handle = HWND(hwnd as _);
@@ -445,19 +445,26 @@ pub fn configure_taskbar_native_styles(hwnd: isize) -> Result<(u32, u32)> {
             SetWindowLongPtrW(handle, GWL_EXSTYLE, target_ex_style as isize);
         }
 
-        // 5. Force frame update and HWND_TOPMOST without moving or stealing focus
+        // 5. Force frame update and HWND_TOPMOST without moving or stealing focus.
+        // Note: SetWindowLongPtrW(GWL_EXSTYLE) cannot set WS_EX_TOPMOST; only SetWindowPos(HWND_TOPMOST) does.
         unsafe {
             use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOWNA};
             let _ = ShowWindow(handle, SW_SHOWNA);
-            let _ = SetWindowPos(
+            if let Err(e) = SetWindowPos(
                 handle,
                 HWND_TOPMOST,
                 0,
                 0,
                 0,
                 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
-            );
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_SHOWWINDOW,
+            ) {
+                tracing::warn!(
+                    hwnd,
+                    error = %e,
+                    "SetWindowPos(HWND_TOPMOST) failed in configure_taskbar_native_styles"
+                );
+            }
         }
 
         // 6. Read back verified styles
@@ -466,15 +473,21 @@ pub fn configure_taskbar_native_styles(hwnd: isize) -> Result<(u32, u32)> {
 
         if (verified_ex_style & WS_EX_TOPMOST.0) == 0 {
             unsafe {
-                let _ = SetWindowPos(
+                if let Err(e) = SetWindowPos(
                     handle,
                     HWND_TOPMOST,
                     0,
                     0,
                     0,
                     0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
-                );
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                ) {
+                    tracing::warn!(
+                        hwnd,
+                        error = %e,
+                        "Retry SetWindowPos(HWND_TOPMOST) failed in configure_taskbar_native_styles"
+                    );
+                }
             }
             verified_ex_style = unsafe { GetWindowLongPtrW(handle, GWL_EXSTYLE) } as u32;
         }
@@ -560,7 +573,7 @@ pub fn apply_native_taskbar_configuration(hwnd: isize) -> Result<(u32, u32)> {
     }
 
     // 2. Configure native styles: WS_POPUP, WS_EX_TOPMOST, WS_EX_TOOLWINDOW, WS_EX_NOACTIVATE, !WS_EX_APPWINDOW
-    let (style, ex_style) = configure_taskbar_native_styles(hwnd)?;
+    let _ = configure_taskbar_native_styles(hwnd)?;
 
     // 3. Query DPI and calculate centered top coordinates on primary monitor
     let dpi = get_window_dpi(hwnd);
@@ -570,7 +583,7 @@ pub fn apply_native_taskbar_configuration(hwnd: isize) -> Result<(u32, u32)> {
         }
     }
 
-    Ok((style, ex_style))
+    get_window_styles(hwnd)
 }
 
 /// Action selected from a taskbar item's native right-click context menu.
