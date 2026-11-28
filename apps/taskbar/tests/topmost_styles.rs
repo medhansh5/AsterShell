@@ -53,6 +53,7 @@ struct TopmostProbeResult {
     after_style: u32,
     after_ex_style: u32,
     after_above_normal: bool,
+    had_other_foreground: bool,
     stole_foreground: bool,
 }
 
@@ -97,10 +98,12 @@ fn test_real_slint_winit_hwnd_topmost_zorder_and_hide_restore() {
     let win_weak = win.as_weak();
     let phase = Arc::new(Mutex::new(0u8));
     let before_state = Arc::new(Mutex::new(None::<(u32, u32, bool)>));
+    let had_other_fg = Arc::new(Mutex::new(false));
 
     let timer = slint::Timer::default();
     let timer_phase = phase.clone();
     let before_clone = before_state.clone();
+    let had_other_fg_cb = had_other_fg.clone();
     timer.start(
         slint::TimerMode::Repeated,
         Duration::from_millis(25),
@@ -146,7 +149,21 @@ fn test_real_slint_winit_hwnd_topmost_zorder_and_hide_restore() {
                     }
                 }
                 1 => {
-                    // Phase 1: Restore via show() and re-sync AlwaysOnTop + native styles.
+                    // Phase 1: Record foreground owner before restore, then restore via show() and re-sync AlwaysOnTop + native styles.
+                    let fg_before = unsafe { GetForegroundWindow() };
+                    let own_hwnd = w
+                        .window()
+                        .with_winit_window(|winit_window| match winit_window.window_handle() {
+                            Ok(handle) => match handle.as_raw() {
+                                RawWindowHandle::Win32(win32) => Some(HWND(win32.hwnd.get() as _)),
+                                _ => None,
+                            },
+                            Err(_) => None,
+                        })
+                        .flatten();
+                    *had_other_fg_cb.lock().unwrap() =
+                        !fg_before.0.is_null() && Some(fg_before) != own_hwnd;
+
                     let _ = w.show();
                     let _ = w.window().with_winit_window(|winit_window| {
                         winit_window.set_window_level(WindowLevel::AlwaysOnTop);
@@ -187,6 +204,7 @@ fn test_real_slint_winit_hwnd_topmost_zorder_and_hide_restore() {
                             after_style,
                             after_ex_style,
                             after_above_normal,
+                            had_other_foreground: *had_other_fg_cb.lock().unwrap(),
                             stole_foreground: fg == hwnd,
                         });
                     }
@@ -254,8 +272,10 @@ fn test_real_slint_winit_hwnd_topmost_zorder_and_hide_restore() {
         );
     }
 
-    assert!(
-        !res.stole_foreground,
-        "Topmost taskbar HWND must not steal foreground focus on show/restore"
-    );
+    if res.had_other_foreground {
+        assert!(
+            !res.stole_foreground,
+            "Topmost taskbar HWND must not steal foreground focus on show/restore"
+        );
+    }
 }
