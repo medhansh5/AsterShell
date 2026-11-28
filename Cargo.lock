@@ -3519,6 +3519,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tracing",
  "windows 0.58.0",
+ "windows-core 0.58.0",
 ]
 
 [[package]]
@@ -4581,13 +4582,16 @@ name = "taskbar"
 version = "0.1.0"
 dependencies = [
  "astercore",
+ "configuration",
  "diagnostics",
  "ipc",
  "platform-windows",
  "process-supervisor",
+ "shell-api",
  "slint",
  "tokio",
  "tracing",
+ "window-tracker",
  "windows 0.58.0",
 ]
 
@@ -5555,7 +5559,10 @@ dependencies = [
 name = "window-tracker"
 version = "0.1.0"
 dependencies = [
+ "astercore",
  "thiserror 1.0.69",
+ "tracing",
+ "windows 0.58.0",
 ]
 
 [[package]]

@@ -1,7 +1,13 @@
 /target/
+/target-*/
 **/*.rs.bk
 *.pdb
 *.exe
 *.log
+*.dmp
+*.tmp
+*.bak
+.env
+.env.*
 .vscode/
 .idea/

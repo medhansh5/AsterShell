@@ -7,7 +7,7 @@ use ipc::{
     transport::{self, NamedPipeServer},
     IpcRequest, IpcResponse, RequestEnvelope, ResponseEnvelope, PROTOCOL_VERSION_1,
 };
-use platform_windows::{default_pipe_address, JobObject};
+use platform_windows::{default_pipe_address, JobObject, TrayAction, TrayIconHandle};
 use process_supervisor::ProcessSupervisor;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -108,8 +108,10 @@ impl ShellHostDaemon {
 
         // 1. Channel to deterministically signal when the IPC listener is bound and ready to accept connections
         let (listener_ready_tx, listener_ready_rx) = tokio::sync::oneshot::channel::<()>();
+        let (toggle_taskbar_tx, _) = watch::channel(0u64);
 
         // 2. Spawn IPC Named Pipe Listener
+        let toggle_for_ipc = toggle_taskbar_tx.clone();
         let ipc_task = tokio::spawn(async move {
             let mut is_first = true;
             let mut ready_sender = Some(listener_ready_tx);
@@ -134,13 +136,14 @@ impl ShellHostDaemon {
 
                             let s_tx = shutdown_tx.clone();
                             let s_rx = shutdown_rx_ipc.clone();
+                            let t_rx = toggle_for_ipc.subscribe();
                             let cfg_json = config_json.clone();
                             let registry = pid_registry.clone();
 
                             tokio::select! {
                                 res = server.connect() => {
                                     if res.is_ok() {
-                                        tokio::spawn(handle_client_connection(server, s_tx, s_rx, cfg_json, registry));
+                                        tokio::spawn(handle_client_connection(server, s_tx, s_rx, t_rx, cfg_json, registry));
                                     }
                                 }
                                 _ = shutdown_rx_ipc.changed() => {
@@ -190,14 +193,72 @@ impl ShellHostDaemon {
             }
         }
 
-        // Supervisor main loop waiting for signal
-        let mut shutdown_rx = self.shutdown_rx.clone();
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                tracing::info!("Ctrl+C interrupt received. Commencing graceful shutdown...");
+        // 6. Start persistent system tray icon with Explorer TaskbarCreated recovery (M3D)
+        let _tray_handle = match TrayIconHandle::start("AsterShell Companion") {
+            Ok((handle, tray_rx)) => {
+                let shutdown_tx_tray = self.shutdown_tx.clone();
+                let toggle_tx_tray = toggle_taskbar_tx.clone();
+                std::thread::Builder::new()
+                    .name("shell-host-tray-events".to_string())
+                    .spawn(move || {
+                        while let Ok(action) = tray_rx.recv() {
+                            let is_exit = matches!(action, TrayAction::Exit);
+                            if let Err(e) = dispatch_tray_action(
+                                action,
+                                &shutdown_tx_tray,
+                                &toggle_tx_tray,
+                                &launch_spotlight_search,
+                            ) {
+                                tracing::warn!(error = %e, "Tray action dispatch failed");
+                            }
+                            if is_exit {
+                                break;
+                            }
+                        }
+                    })
+                    .ok();
+                Some(handle)
             }
-            _ = shutdown_rx.changed() => {
-                tracing::info!("Shutdown signal received from IPC watch channel.");
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to initialize system tray icon; continuing headless");
+                None
+            }
+        };
+
+        // Supervisor main loop: monitor child processes and wait for shutdown signal
+        let mut shutdown_rx = self.shutdown_rx.clone();
+        let mut monitor_interval = tokio::time::interval(Duration::from_millis(250));
+        monitor_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Consume the initial immediate tick so polling starts after the first interval.
+        monitor_interval.tick().await;
+
+        loop {
+            if !self.is_running.load(Ordering::SeqCst) || *shutdown_rx.borrow() {
+                break;
+            }
+
+            tokio::select! {
+                biased;
+                _ = tokio::signal::ctrl_c() => {
+                    tracing::info!("Ctrl+C interrupt received. Commencing graceful shutdown...");
+                    break;
+                }
+                res = shutdown_rx.changed() => {
+                    if res.is_err() || *shutdown_rx.borrow() {
+                        tracing::info!("Shutdown signal received from IPC watch channel.");
+                        break;
+                    }
+                }
+                _ = monitor_interval.tick() => {
+                    if !self.is_running.load(Ordering::SeqCst) || *shutdown_rx.borrow() {
+                        break;
+                    }
+                    if self.config.supervisor.auto_restart_crashed_children {
+                        let _ = self.supervisor.poll_and_recover().await;
+                    } else {
+                        let _ = self.supervisor.poll_health().await;
+                    }
+                }
             }
         }
 
@@ -220,11 +281,45 @@ impl ShellHostDaemon {
     }
 }
 
+fn launch_spotlight_search() -> Result<()> {
+    let exe = resolve_component_executable(ComponentId::SearchUi);
+    std::process::Command::new(&exe).spawn().map_err(|e| {
+        astercore::AsterError::Platform(format!("Failed to launch {}: {}", exe.display(), e))
+    })?;
+    Ok(())
+}
+
+pub fn dispatch_tray_action(
+    action: TrayAction,
+    shutdown_tx: &watch::Sender<bool>,
+    toggle_tx: &watch::Sender<u64>,
+    open_search_fn: &dyn Fn() -> Result<()>,
+) -> Result<()> {
+    match action {
+        TrayAction::OpenSearch => {
+            tracing::info!("System tray action: OpenSearch");
+            open_search_fn()
+        }
+        TrayAction::ToggleTaskbar => {
+            tracing::info!("System tray action: ToggleTaskbar");
+            let next = toggle_tx.borrow().wrapping_add(1);
+            let _ = toggle_tx.send(next);
+            Ok(())
+        }
+        TrayAction::Exit => {
+            tracing::info!("System tray action: Exit AsterShell requested");
+            let _ = shutdown_tx.send(true);
+            Ok(())
+        }
+    }
+}
+
 #[cfg(windows)]
 async fn handle_client_connection(
     mut stream: NamedPipeServer,
     shutdown_tx: watch::Sender<bool>,
     mut shutdown_rx: watch::Receiver<bool>,
+    mut toggle_rx: watch::Receiver<u64>,
     config_json: String,
     pid_registry: process_supervisor::SupervisedPidRegistry,
 ) {
@@ -245,6 +340,15 @@ async fn handle_client_connection(
                     };
                     let _ = transport::write_framed_message(&mut stream, &notice).await;
                     break;
+                }
+            }
+            _ = toggle_rx.changed() => {
+                if is_authenticated {
+                    let notice = ResponseEnvelope {
+                        request_id: 0,
+                        response: IpcResponse::ToggleTaskbarNotice,
+                    };
+                    let _ = transport::write_framed_message(&mut stream, &notice).await;
                 }
             }
             req_res = transport::read_framed_message::<_, RequestEnvelope>(&mut stream) => {
@@ -1009,6 +1113,93 @@ mod tests {
         assert!(
             daemon.supervisor().status(ComponentId::Taskbar).is_none(),
             "Taskbar must NOT be registered when disabled in config"
+        );
+    }
+
+    #[test]
+    fn test_tray_action_dispatch_all_handlers() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (toggle_tx, toggle_rx) = watch::channel(0u64);
+        let search_count = std::sync::atomic::AtomicUsize::new(0);
+
+        dispatch_tray_action(TrayAction::OpenSearch, &shutdown_tx, &toggle_tx, &|| {
+            search_count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .expect("OpenSearch dispatch");
+        assert_eq!(search_count.load(Ordering::SeqCst), 1);
+        assert!(!*shutdown_rx.borrow(), "OpenSearch must not shut down host");
+
+        dispatch_tray_action(TrayAction::ToggleTaskbar, &shutdown_tx, &toggle_tx, &|| {
+            Ok(())
+        })
+        .expect("ToggleTaskbar dispatch");
+        assert_eq!(*toggle_rx.borrow(), 1);
+        assert!(
+            !*shutdown_rx.borrow(),
+            "ToggleTaskbar must not shut down host"
+        );
+
+        // Failing OpenSearch returns error cleanly without terminating host
+        let err_res =
+            dispatch_tray_action(TrayAction::OpenSearch, &shutdown_tx, &toggle_tx, &|| {
+                Err(astercore::AsterError::Platform("missing binary".into()))
+            });
+        assert!(err_res.is_err());
+        assert!(!*shutdown_rx.borrow());
+
+        dispatch_tray_action(TrayAction::Exit, &shutdown_tx, &toggle_tx, &|| Ok(()))
+            .expect("Exit dispatch");
+        assert!(*shutdown_rx.borrow(), "Exit must signal shutdown");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_shell_host_monitors_and_restarts_crashed_child() {
+        let test_pipe = format!(r"\\.\pipe\astershell-test-recover-{}", std::process::id());
+        let mut daemon =
+            ShellHostDaemon::new_with_pipe(&test_pipe).expect("Failed to initialize daemon");
+        // Disable default taskbar auto-registration so our custom failing spec is not overwritten
+        daemon.config.taskbar.enabled = false;
+        daemon.register_component(process_supervisor::ProcessSpec {
+            id: ComponentId::Taskbar,
+            executable: std::path::PathBuf::from("cmd.exe"),
+            args: vec!["/c".into(), "exit /b 1".into()],
+            restart_policy: astercore::RestartPolicy {
+                max_retries_in_window: 3,
+                window_secs: 10,
+                initial_backoff_ms: 50,
+                max_backoff_ms: 100,
+                circuit_breaker_threshold: 2,
+            },
+        });
+        let initial_pid = daemon
+            .spawn_component(ComponentId::Taskbar)
+            .expect("Initial component spawn");
+        let pid_registry = daemon.supervisor().pid_registry();
+        assert!(pid_registry.is_authorized(initial_pid));
+
+        let shutdown_tx = daemon.shutdown_tx.clone();
+        let daemon_task = tokio::spawn(async move {
+            let res = daemon.run().await;
+            (daemon, res)
+        });
+
+        // Allow monitor loop (250ms interval) to detect crash #1, respawn, and hit circuit breaker on crash #2
+        tokio::time::sleep(Duration::from_millis(900)).await;
+
+        assert!(
+            !pid_registry.is_authorized(initial_pid),
+            "Stale crashed PID must be deauthorized by monitor loop"
+        );
+
+        let _ = shutdown_tx.send(true);
+        let (daemon, run_res) = daemon_task.await.expect("Daemon task join");
+        assert!(run_res.is_ok(), "Daemon must exit cleanly on shutdown");
+        assert_eq!(
+            daemon.supervisor().status(ComponentId::Taskbar),
+            Some(astercore::ProcessStatus::Stopped),
+            "Shutdown must transition supervised component to Stopped"
         );
     }
 }

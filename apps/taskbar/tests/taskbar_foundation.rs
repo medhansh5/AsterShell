@@ -478,6 +478,79 @@ fn test_ac_m3a_02_and_03_real_slint_taskbar_window_native_styles() {
     );
 }
 
+#[cfg(windows)]
+#[test]
+fn test_f_p2_01_win32_hide_restore_preserves_native_styles() {
+    use platform_windows::{
+        configure_taskbar_native_styles, get_window_styles, WS_EX_APPWINDOW_FLAG,
+        WS_EX_NOACTIVATE_FLAG, WS_EX_TOOLWINDOW_FLAG, WS_EX_TOPMOST_FLAG, WS_POPUP_FLAG,
+    };
+    use windows::core::{HSTRING, PCWSTR};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DestroyWindow, ShowWindow, SW_HIDE, SW_SHOWNA, WS_EX_NOACTIVATE,
+        WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    };
+
+    let hwnd = unsafe {
+        CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            PCWSTR(HSTRING::from("STATIC").as_ptr()),
+            PCWSTR(HSTRING::from("AsterHideRestoreTest").as_ptr()),
+            WS_POPUP,
+            0,
+            0,
+            720,
+            48,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("CreateWindowExW for hide/restore test")
+    };
+
+    let hwnd_raw = hwnd.0 as isize;
+    let _ = configure_taskbar_native_styles(hwnd_raw).expect("Initial style config");
+
+    // Simulate hide then restore without stealing activation
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_HIDE);
+        let _ = ShowWindow(hwnd, SW_SHOWNA);
+    }
+
+    let (style, ex_style) =
+        configure_taskbar_native_styles(hwnd_raw).expect("Restore style config");
+    let (read_style, read_ex_style) = get_window_styles(hwnd_raw).expect("Read back styles");
+    assert_eq!(style, read_style);
+    assert_eq!(ex_style, read_ex_style);
+
+    assert_ne!(style & WS_POPUP_FLAG, 0, "WS_POPUP must be preserved");
+    assert_ne!(
+        ex_style & WS_EX_TOPMOST_FLAG,
+        0,
+        "WS_EX_TOPMOST must be preserved after restore"
+    );
+    assert_ne!(
+        ex_style & WS_EX_TOOLWINDOW_FLAG,
+        0,
+        "WS_EX_TOOLWINDOW must be preserved after restore"
+    );
+    assert_ne!(
+        ex_style & WS_EX_NOACTIVATE_FLAG,
+        0,
+        "WS_EX_NOACTIVATE must be preserved after restore"
+    );
+    assert_eq!(
+        ex_style & WS_EX_APPWINDOW_FLAG,
+        0,
+        "WS_EX_APPWINDOW must never be added on restore"
+    );
+
+    unsafe {
+        let _ = DestroyWindow(hwnd);
+    }
+}
+
 // ============================================================================
 // Category C: Real Process Containment & Supervisor Lifecycle Integration Tests
 // ============================================================================
@@ -1018,4 +1091,452 @@ async fn test_ac_m3a_09_non_responsive_taskbar_forcibly_terminated_on_timeout() 
             );
         }
     }
+}
+
+// ============================================================================
+// Category E: F-P1-01 Supervisor Crash Recovery & Lifecycle Regression Tests
+// ============================================================================
+
+/// F-P1-01: Real Windows integration test for supervisor crash recovery.
+/// Spawns real `taskbar.exe --test-child`, completes IPC handshake #1, kills the
+/// child unexpectedly via Win32 `TerminateProcess`, runs `poll_and_recover`,
+/// verifies replacement PID != old PID, stale PID deauthorization, `IsProcessInJob`
+/// on the replacement child, fresh IPC handshake #2, and verifies intentional
+/// `shutdown_all` does NOT restart.
+#[cfg(windows)]
+#[tokio::test]
+async fn test_f_p1_01_real_child_crash_recovery_ipc_and_job_object() {
+    use astercore::ProcessStatus;
+    use process_supervisor::SupervisorAction;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+    use windows::Win32::System::Threading::{
+        OpenProcess, TerminateProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    };
+
+    let test_pipe_name = format!(
+        r"\\.\pipe\astershell-test-fp101-recovery-{}",
+        std::process::id()
+    );
+    let job_name = format!("AsterShellFP101-RecoveryJob-{}", std::process::id());
+    let job = JobObject::create(&job_name).expect("JobObject::create must succeed");
+    let mut supervisor = process_supervisor::ProcessSupervisor::new(job);
+    let pid_registry = supervisor.pid_registry();
+
+    let taskbar_exe = resolve_taskbar_exe();
+    assert!(
+        taskbar_exe.exists(),
+        "Resolved taskbar executable must exist at {:?}",
+        taskbar_exe
+    );
+
+    supervisor.register(process_supervisor::ProcessSpec {
+        id: ComponentId::Taskbar,
+        executable: taskbar_exe,
+        args: vec![
+            "--test-child".to_string(),
+            "--supervisor-pipe".to_string(),
+            test_pipe_name.clone(),
+        ],
+        restart_policy: astercore::RestartPolicy {
+            max_retries_in_window: 3,
+            window_secs: 10,
+            initial_backoff_ms: 50,
+            max_backoff_ms: 200,
+            circuit_breaker_threshold: 5,
+        },
+    });
+
+    let (handshake_tx, mut handshake_rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
+    let server_stop = Arc::new(AtomicBool::new(false));
+    let server_stop_clone = server_stop.clone();
+    let registry_for_server = pid_registry.clone();
+    let pipe_for_server = test_pipe_name.clone();
+
+    // Channel to ensure the first named pipe instance is bound before spawning the child.
+    let (pipe_ready_tx, pipe_ready_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let server_task = tokio::spawn(async move {
+        let mut is_first = true;
+        let mut ready_tx = Some(pipe_ready_tx);
+
+        while !server_stop_clone.load(Ordering::SeqCst) {
+            let mut pipe_sec = default_pipe_sddl()
+                .ok()
+                .and_then(|sddl| PipeSecurityDescriptor::from_sddl(&sddl).ok());
+            let sa_ptr = pipe_sec.as_mut().map(|s| s.as_raw_mut_ptr());
+
+            let server = match transport::create_pipe_server_with_security(
+                &pipe_for_server,
+                is_first,
+                sa_ptr,
+            ) {
+                Ok(s) => s,
+                Err(_) => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    continue;
+                }
+            };
+            is_first = false;
+            if let Some(tx) = ready_tx.take() {
+                let _ = tx.send(());
+            }
+
+            let accept_res =
+                tokio::time::timeout(Duration::from_millis(200), server.connect()).await;
+            let mut stream: NamedPipeServer = match accept_res {
+                Ok(Ok(())) => server,
+                _ => continue,
+            };
+
+            let reg = registry_for_server.clone();
+            let hs_tx = handshake_tx.clone();
+            tokio::spawn(async move {
+                if let Ok(req) =
+                    transport::read_framed_message::<_, RequestEnvelope>(&mut stream).await
+                {
+                    if let IpcRequest::Handshake { .. } = req.request {
+                        let client_pid =
+                            platform_windows::get_pipe_client_pid(&stream).unwrap_or(0);
+                        let response = if reg.is_authorized(client_pid) {
+                            let _ = hs_tx.send(client_pid);
+                            IpcResponse::HandshakeAck {
+                                negotiated_version: PROTOCOL_VERSION_1,
+                                server_pid: std::process::id(),
+                            }
+                        } else {
+                            IpcResponse::Error(format!("Unauthorized PID {}", client_pid))
+                        };
+                        let resp_env = ResponseEnvelope {
+                            request_id: req.request_id,
+                            response,
+                        };
+                        let _ = transport::write_framed_message(&mut stream, &resp_env).await;
+                        // Keep stream open until client disconnects or dies
+                        let _ =
+                            transport::read_framed_message::<_, RequestEnvelope>(&mut stream).await;
+                    }
+                }
+            });
+        }
+    });
+
+    pipe_ready_rx
+        .await
+        .expect("Named pipe server must bind before spawning child");
+
+    // 1. Spawn initial child and verify PID, registry, Job Object, and IPC handshake #1
+    let pid1 = supervisor
+        .spawn(ComponentId::Taskbar)
+        .expect("Initial taskbar spawn must succeed");
+    assert!(pid1 > 0);
+    assert!(pid_registry.is_authorized(pid1));
+    assert!(
+        supervisor
+            .is_child_in_job(ComponentId::Taskbar)
+            .expect("is_child_in_job"),
+        "Initial child must be inside JobObject"
+    );
+
+    let hs_pid1 = tokio::time::timeout(Duration::from_secs(5), handshake_rx.recv())
+        .await
+        .expect("Timed out waiting for initial child IPC handshake")
+        .expect("Handshake channel closed");
+    assert_eq!(hs_pid1, pid1, "Initial IPC handshake must come from pid1");
+
+    // 2. Kill child unexpectedly via Win32 TerminateProcess (simulating crash)
+    let proc_handle: HANDLE = unsafe {
+        OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, false, pid1)
+            .expect("OpenProcess on pid1 must succeed")
+    };
+    unsafe {
+        TerminateProcess(proc_handle, 0xC000013Au32)
+            .expect("TerminateProcess must succeed to simulate crash");
+        let wait_res = WaitForSingleObject(proc_handle, 3000);
+        let _ = CloseHandle(proc_handle);
+        assert_eq!(
+            wait_res, WAIT_OBJECT_0,
+            "pid1 must exit after TerminateProcess"
+        );
+    }
+
+    // 3. Supervisor detects unexpected exit and spawns replacement child
+    let actions = supervisor.poll_and_recover().await;
+    assert_eq!(
+        actions,
+        vec![SupervisorAction::RestartingImmediately(
+            ComponentId::Taskbar
+        )],
+        "Unexpected child exit must trigger immediate recovery"
+    );
+
+    assert!(
+        !pid_registry.is_authorized(pid1),
+        "Stale crashed PID {} must be deauthorized",
+        pid1
+    );
+
+    let pid2 = supervisor
+        .child_pid(ComponentId::Taskbar)
+        .expect("Replacement child PID must be present");
+    assert_ne!(pid2, pid1, "Replacement PID must differ from crashed PID");
+    assert!(
+        pid_registry.is_authorized(pid2),
+        "Replacement PID {} must be authorized in registry",
+        pid2
+    );
+    assert!(
+        supervisor
+            .is_child_in_job(ComponentId::Taskbar)
+            .expect("is_child_in_job on replacement"),
+        "Replacement child {} must be contained in the same JobObject (IsProcessInJob)",
+        pid2
+    );
+
+    // 4. Verify fresh IPC handshake from replacement child
+    let hs_pid2 = tokio::time::timeout(Duration::from_secs(5), handshake_rx.recv())
+        .await
+        .expect("Timed out waiting for replacement child IPC handshake")
+        .expect("Handshake channel closed");
+    assert_eq!(
+        hs_pid2, pid2,
+        "Fresh IPC handshake must come from replacement pid2"
+    );
+
+    // 5. Verify intentional shutdown does NOT restart
+    supervisor
+        .shutdown_all(Duration::from_millis(500))
+        .await
+        .expect("shutdown_all must succeed");
+    assert_eq!(
+        supervisor.status(ComponentId::Taskbar),
+        Some(ProcessStatus::Stopped),
+        "Intentional shutdown must transition status to Stopped"
+    );
+    assert!(
+        supervisor.child_pid(ComponentId::Taskbar).is_none(),
+        "No child PID must remain after intentional shutdown"
+    );
+    assert!(
+        !pid_registry.is_authorized(pid2),
+        "Replacement PID {} must be deauthorized after shutdown",
+        pid2
+    );
+
+    let post_shutdown_actions = supervisor.poll_and_recover().await;
+    assert!(
+        post_shutdown_actions.is_empty(),
+        "Intentional shutdown must NOT trigger restart: got {:?}",
+        post_shutdown_actions
+    );
+    assert!(supervisor.child_pid(ComponentId::Taskbar).is_none());
+
+    server_stop.store(true, Ordering::SeqCst);
+    let _ = server_task.await;
+}
+
+/// F-P1-01: Lifecycle regression test for no duplicate children, backoff delay,
+/// stale PID removal, and circuit-breaker exhaustion.
+#[cfg(windows)]
+#[tokio::test]
+async fn test_f_p1_01_supervisor_backoff_exhaustion_stale_pid_and_no_duplicates() {
+    use astercore::ProcessStatus;
+    use process_supervisor::SupervisorAction;
+
+    let job_name = format!("AsterShellFP101-LifecycleJob-{}", std::process::id());
+    let job = JobObject::create(&job_name).expect("JobObject::create");
+    let mut supervisor = process_supervisor::ProcessSupervisor::new(job);
+
+    // Register a long-lived child first to verify duplicate spawn rejection
+    supervisor.register(process_supervisor::ProcessSpec {
+        id: ComponentId::Desktop,
+        executable: PathBuf::from("cmd.exe"),
+        args: vec!["/c".into(), "ping -n 6 127.0.0.1 >nul".into()],
+        restart_policy: astercore::RestartPolicy::default(),
+    });
+    let live_pid = supervisor
+        .spawn(ComponentId::Desktop)
+        .expect("Initial Desktop spawn must succeed");
+    assert!(
+        supervisor.spawn(ComponentId::Desktop).is_err(),
+        "Duplicate spawn of running component must be rejected"
+    );
+    assert_eq!(supervisor.child_pid(ComponentId::Desktop), Some(live_pid));
+    supervisor
+        .shutdown_all(Duration::from_millis(200))
+        .await
+        .expect("shutdown_all");
+    assert!(!supervisor.is_supervised_pid(live_pid));
+
+    // Register a fast-exiting child to test immediate restart -> backoff -> exhaustion
+    supervisor.register(process_supervisor::ProcessSpec {
+        id: ComponentId::Taskbar,
+        executable: PathBuf::from("cmd.exe"),
+        args: vec!["/c".into(), "exit /b 1".into()],
+        restart_policy: astercore::RestartPolicy {
+            max_retries_in_window: 1,
+            window_secs: 60,
+            initial_backoff_ms: 120,
+            max_backoff_ms: 250,
+            circuit_breaker_threshold: 3,
+        },
+    });
+
+    let pid1 = supervisor
+        .spawn(ComponentId::Taskbar)
+        .expect("Spawn #1 must succeed");
+    assert!(supervisor.is_supervised_pid(pid1));
+
+    // Crash #1 -> immediate restart (within max_retries_in_window = 1)
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let actions1 = supervisor.poll_and_recover().await;
+    assert_eq!(
+        actions1,
+        vec![SupervisorAction::RestartingImmediately(
+            ComponentId::Taskbar
+        )]
+    );
+    assert!(
+        !supervisor.is_supervised_pid(pid1),
+        "Stale PID 1 must be removed"
+    );
+    let pid2 = supervisor
+        .child_pid(ComponentId::Taskbar)
+        .expect("PID 2 must be spawned");
+    assert_ne!(pid2, pid1);
+    assert!(supervisor.is_supervised_pid(pid2));
+
+    // Crash #2 -> exceeds max_retries_in_window (1), enters BackoffPaused
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let actions2 = supervisor.poll_and_recover().await;
+    assert!(
+        matches!(
+            actions2.as_slice(),
+            [SupervisorAction::BackoffDelay {
+                id: ComponentId::Taskbar,
+                delay_ms
+            }] if *delay_ms >= 120
+        ),
+        "Crash #2 must enter BackoffDelay, got {:?}",
+        actions2
+    );
+    assert!(
+        !supervisor.is_supervised_pid(pid2),
+        "Stale PID 2 must be removed on backoff"
+    );
+    assert!(supervisor.child_pid(ComponentId::Taskbar).is_none());
+
+    // Polling before backoff expires must not respawn
+    let early_actions = supervisor.poll_and_recover().await;
+    assert!(
+        early_actions.is_empty(),
+        "Must not respawn before backoff delay expires"
+    );
+    assert!(supervisor.child_pid(ComponentId::Taskbar).is_none());
+
+    // Wait for backoff (240ms) to elapse, then poll_and_recover must respawn PID 3
+    tokio::time::sleep(Duration::from_millis(280)).await;
+    let actions_after_backoff = supervisor.poll_and_recover().await;
+    assert_eq!(
+        actions_after_backoff,
+        vec![SupervisorAction::RestartingImmediately(
+            ComponentId::Taskbar
+        )]
+    );
+    let pid3 = supervisor
+        .child_pid(ComponentId::Taskbar)
+        .expect("PID 3 must be spawned after backoff");
+    assert_ne!(pid3, pid2);
+    assert!(supervisor.is_supervised_pid(pid3));
+
+    // Crash #3 -> hits circuit_breaker_threshold (3) -> CircuitBroken
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let actions3 = supervisor.poll_and_recover().await;
+    assert_eq!(
+        actions3,
+        vec![SupervisorAction::CircuitBroken(ComponentId::Taskbar)]
+    );
+    assert!(
+        !supervisor.is_supervised_pid(pid3),
+        "Stale PID 3 must be removed on circuit break"
+    );
+    assert!(supervisor.child_pid(ComponentId::Taskbar).is_none());
+    assert_eq!(
+        supervisor.status(ComponentId::Taskbar),
+        Some(ProcessStatus::CircuitBroken {
+            consecutive_crashes: 3
+        })
+    );
+
+    // Exhausted circuit breaker must not respawn on subsequent polls
+    let exhausted_actions = supervisor.poll_and_recover().await;
+    assert!(exhausted_actions.is_empty());
+    assert!(supervisor.child_pid(ComponentId::Taskbar).is_none());
+}
+
+// ============================================================================
+// Category F: Native HWND Topmost Z-Order & Extended Styles Regression Tests
+// ============================================================================
+
+#[cfg(windows)]
+fn is_hwnd_above_in_zorder(upper: HWND, lower: HWND) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{GetTopWindow, GetWindow, GW_HWNDNEXT};
+
+    let mut cur = unsafe { GetTopWindow(None) }.ok();
+    let mut seen_upper = false;
+    while let Some(h) = cur {
+        if h == upper {
+            seen_upper = true;
+        } else if h == lower {
+            return seen_upper;
+        }
+        cur = unsafe { GetWindow(h, GW_HWNDNEXT) }.ok();
+    }
+    false
+}
+
+/// Verifies on a real Win32 HWND that `configure_taskbar_native_styles` +
+/// `position_taskbar_window` establishes `WS_EX_TOPMOST`, `WS_EX_TOOLWINDOW`,
+/// `WS_EX_NOACTIVATE`, `!WS_EX_APPWINDOW`, and places the HWND above a normal
+/// non-topmost window in Z-order both before and after hide/restore.
+#[cfg(windows)]
+#[test]
+fn test_topmost_zorder_and_extended_styles_before_and_after_hide_restore() {
+    use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE, SW_SHOWNA};
+
+    let taskbar_win = TestWindow::new();
+    let normal_win = TestWindow::new();
+
+    let (style, ex_style) = apply_native_taskbar_configuration(taskbar_win.as_isize())
+        .expect("apply_native_taskbar_configuration must succeed");
+    assert_ne!(style & WS_POPUP_FLAG, 0);
+    assert_ne!(ex_style & WS_EX_TOPMOST_FLAG, 0);
+    assert_ne!(ex_style & WS_EX_TOOLWINDOW_FLAG, 0);
+    assert_ne!(ex_style & WS_EX_NOACTIVATE_FLAG, 0);
+    assert_eq!(ex_style & WS_EX_APPWINDOW_FLAG, 0);
+
+    assert!(
+        is_hwnd_above_in_zorder(taskbar_win.hwnd, normal_win.hwnd),
+        "Topmost taskbar HWND must be above normal non-topmost HWND in Z-order before hide"
+    );
+
+    // Hide then restore without activating
+    unsafe {
+        let _ = ShowWindow(taskbar_win.hwnd, SW_HIDE);
+        let _ = ShowWindow(taskbar_win.hwnd, SW_SHOWNA);
+    }
+
+    let (_, ex_after) = apply_native_taskbar_configuration(taskbar_win.as_isize())
+        .expect("apply_native_taskbar_configuration after restore must succeed");
+    let (_, read_ex_after) =
+        get_window_styles(taskbar_win.as_isize()).expect("get_window_styles after restore");
+    assert_eq!(ex_after, read_ex_after);
+    assert_ne!(ex_after & WS_EX_TOPMOST_FLAG, 0);
+    assert_ne!(ex_after & WS_EX_TOOLWINDOW_FLAG, 0);
+    assert_ne!(ex_after & WS_EX_NOACTIVATE_FLAG, 0);
+    assert_eq!(ex_after & WS_EX_APPWINDOW_FLAG, 0);
+
+    assert!(
+        is_hwnd_above_in_zorder(taskbar_win.hwnd, normal_win.hwnd),
+        "Topmost taskbar HWND must remain above normal non-topmost HWND in Z-order after hide/restore"
+    );
 }

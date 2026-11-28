@@ -1,129 +1,463 @@
 //! AsterShell Floating Companion Taskbar (`taskbar`)
 //!
-//! Milestone M3A: Native Taskbar Window Foundation & Lifecycle.
 //! Supervised floating companion window built with Slint and Win32 APIs,
 //! supporting non-activating topmost presentation, DWM Mica composition,
-//! signed physical placement at the top of the primary monitor, zero work-area
-//! contraction, and authenticated supervisor IPC lifecycle coordination.
+//! multi-monitor placement, event-driven window tracking, pinned & running
+//! app interactions, zero-polling system indicators, and keyboard navigation.
 
 use astercore::{ComponentId, Result};
 use diagnostics::{init_diagnostics, DiagnosticConfig};
 use ipc::{
     transport, IpcRequest, IpcResponse, RequestEnvelope, ResponseEnvelope, PROTOCOL_VERSION_1,
 };
-use platform_windows::{apply_native_taskbar_configuration, default_pipe_address};
-use slint::ComponentHandle;
+use platform_windows::{
+    default_pipe_address, register_global_hotkey, AudioMonitorHandle, HotkeyConfig,
+    NetworkMonitorHandle, PowerMonitorHandle,
+};
+use slint::{ComponentHandle, ModelRc, VecModel};
 use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use window_tracker::WindowInfo;
 
 slint::slint! {
     #[edition = "1.19"]
+    export { TaskbarWindow, TaskbarAppItem } from "ui/taskbar.slint";
+}
 
-    export component TaskbarWindow inherits Window {
-        title: "AsterShell Taskbar";
-        preferred-width: 720px;
-        preferred-height: 48px;
-        min-width: 720px;
-        max-width: 720px;
-        min-height: 48px;
-        max-height: 48px;
-        background: transparent;
-        no-frame: true;
+use configuration::PinnedAppConfig;
 
-        in-out property <string> status_text: "✦ AsterShell • Floating Companion";
-        in-out property <string> mode_badge: "M3A FOUNDATION";
-
-        callback action_clicked();
-
-        // Main floating companion capsule
-        Rectangle {
-            width: 100%;
-            height: 100%;
-            border-radius: 14px;
-            background: rgba(20, 20, 26, 0.94);
-            border-width: 1px;
-            border-color: rgba(255, 255, 255, 0.12);
-
-            HorizontalLayout {
-                padding-left: 16px;
-                padding-right: 16px;
-                spacing: 12px;
-                alignment: center;
-
-                // Brand Pill / Launcher indicator
-                HorizontalLayout {
-                    spacing: 8px;
-                    alignment: center;
-
-                    Text {
-                        text: "✦";
-                        font-size: 15px;
-                        color: #60a5fa;
-                        vertical-alignment: center;
-                    }
-
-                    Text {
-                        text: "AsterTaskbar";
-                        font-size: 13px;
-                        font-weight: 700;
-                        color: #f4f4f6;
-                        vertical-alignment: center;
-                    }
-                }
-
-                // Vertical Divider
-                Rectangle {
-                    width: 1px;
-                    height: 20px;
-                    background: rgba(255, 255, 255, 0.15);
-                }
-
-                // Status Message / Companion Mode
-                Text {
-                    text <=> root.status_text;
-                    font-size: 12px;
-                    color: #94a3b8;
-                    horizontal-stretch: 1;
-                    vertical-alignment: center;
-                    overflow: elide;
-                }
-
-                // Mode Badge
-                Rectangle {
-                    border-radius: 6px;
-                    background: rgba(59, 130, 246, 0.18);
-                    border-width: 1px;
-                    border-color: rgba(59, 130, 246, 0.40);
-                    height: 24px;
-
-                    HorizontalLayout {
-                        padding-left: 8px;
-                        padding-right: 8px;
-                        alignment: center;
-
-                        Text {
-                            text <=> root.mode_badge;
-                            font-size: 10px;
-                            font-weight: 600;
-                            color: #93c5fd;
-                            vertical-alignment: center;
-                        }
-                    }
-                }
-            }
-        }
+fn make_monogram(name: &str) -> String {
+    let clean: String = name.chars().filter(|c| c.is_alphanumeric()).collect();
+    let mut chars = clean.chars();
+    match (chars.next(), chars.next()) {
+        (Some(a), Some(b)) => format!("{}{}", a.to_ascii_uppercase(), b.to_ascii_uppercase()),
+        (Some(a), None) => a.to_ascii_uppercase().to_string(),
+        _ => "AP".to_string(),
     }
 }
 
-/// Applies native Win32 window styles, DWM Mica backdrop, and primary-monitor positioning.
-pub fn apply_taskbar_native_styles(win: &TaskbarWindow) -> Option<isize> {
+/// Authoritative visibility state and surface topology tracker for single- and all-monitor modes.
+#[derive(Debug, Clone)]
+pub struct TaskbarVisibilityState {
+    pub visible: bool,
+    pub surfaces: Vec<String>,
+}
+
+/// Plan produced when reconciling active surfaces against desired monitor devices.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VisibilityReconcilePlan {
+    pub to_remove: Vec<String>,
+    pub to_keep: Vec<(String, bool)>,
+    pub to_add: Vec<(String, bool)>,
+}
+
+impl TaskbarVisibilityState {
+    pub fn new(primary_device: &str) -> Self {
+        Self {
+            visible: true,
+            surfaces: vec![primary_device.to_string()],
+        }
+    }
+
+    /// Flips the single authoritative visibility flag and returns the new target visibility.
+    pub fn toggle(&mut self) -> bool {
+        self.visible = !self.visible;
+        self.visible
+    }
+
+    /// Reconciles tracked monitor devices against `desired_devices`, preserving `self.visible`
+    /// for both surviving and newly added surfaces.
+    pub fn reconcile(&mut self, desired_devices: &[String]) -> VisibilityReconcilePlan {
+        let mut to_remove = Vec::new();
+        let mut to_keep = Vec::new();
+        let mut to_add = Vec::new();
+
+        for dev in &self.surfaces {
+            if !desired_devices.iter().any(|d| d.eq_ignore_ascii_case(dev)) {
+                to_remove.push(dev.clone());
+            }
+        }
+
+        self.surfaces
+            .retain(|dev| desired_devices.iter().any(|d| d.eq_ignore_ascii_case(dev)));
+
+        for dev in desired_devices {
+            if self.surfaces.iter().any(|d| d.eq_ignore_ascii_case(dev)) {
+                to_keep.push((dev.clone(), self.visible));
+            } else {
+                self.surfaces.push(dev.clone());
+                to_add.push((dev.clone(), self.visible));
+            }
+        }
+
+        VisibilityReconcilePlan {
+            to_remove,
+            to_keep,
+            to_add,
+        }
+    }
+
+    /// Removes a missing or destroyed surface cleanly without altering other surfaces.
+    pub fn mark_destroyed(&mut self, device: &str) {
+        self.surfaces.retain(|d| !d.eq_ignore_ascii_case(device));
+    }
+
+    /// Returns `(device_name, visible)` for all currently tracked surfaces.
+    pub fn surface_visibility_targets(&self) -> Vec<(String, bool)> {
+        self.surfaces
+            .iter()
+            .map(|d| (d.clone(), self.visible))
+            .collect()
+    }
+}
+
+/// Pointer-width-safe bidirectional table mapping 32-bit Slint UI `item_id`s
+/// to full 64-bit Win32 `isize` HWND handles without truncation.
+#[derive(Debug, Default)]
+pub struct HwndHandleTable {
+    next_id: i32,
+    id_to_hwnd: std::collections::HashMap<i32, isize>,
+    hwnd_to_id: std::collections::HashMap<isize, i32>,
+}
+
+impl HwndHandleTable {
+    pub fn new() -> Self {
+        Self {
+            next_id: 1,
+            id_to_hwnd: std::collections::HashMap::new(),
+            hwnd_to_id: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Registers (or retrieves) a stable non-zero `i32` UI ID for a full pointer-width `isize` HWND.
+    pub fn register(&mut self, hwnd: isize) -> i32 {
+        if hwnd == 0 {
+            return 0;
+        }
+        if let Some(&id) = self.hwnd_to_id.get(&hwnd) {
+            return id;
+        }
+        let mut id = self.next_id;
+        if id <= 0 {
+            id = 1;
+        }
+        while self.id_to_hwnd.contains_key(&id) {
+            id = id.wrapping_add(1).max(1);
+        }
+        self.next_id = id.wrapping_add(1).max(1);
+        self.id_to_hwnd.insert(id, hwnd);
+        self.hwnd_to_id.insert(hwnd, id);
+        id
+    }
+
+    /// Resolves a Slint UI `item_id` back to its full pointer-width `isize` HWND.
+    pub fn resolve(&self, item_id: i32) -> Option<isize> {
+        if item_id <= 0 {
+            return None;
+        }
+        self.id_to_hwnd.get(&item_id).copied()
+    }
+
+    /// Prunes entries no longer present in the live tracked window list.
+    pub fn retain_live(&mut self, windows: &[WindowInfo]) {
+        let live: std::collections::HashSet<isize> = windows.iter().map(|w| w.hwnd).collect();
+        self.hwnd_to_id.retain(|hwnd, _| live.contains(hwnd));
+        self.id_to_hwnd.retain(|_, hwnd| live.contains(hwnd));
+    }
+}
+
+/// Builds the combined list of configured pinned apps and live running windows for the taskbar strip.
+pub fn build_taskbar_app_items(
+    windows: &[WindowInfo],
+    pinned_apps: &[PinnedAppConfig],
+    table: &mut HwndHandleTable,
+) -> Vec<TaskbarAppItem> {
+    table.retain_live(windows);
+    let mut items = Vec::new();
+    let mut matched_hwnds = std::collections::HashSet::new();
+
+    for pinned in pinned_apps {
+        let matching_win = windows.iter().find(|w| {
+            w.process_name.eq_ignore_ascii_case(&pinned.process_key)
+                && !matched_hwnds.contains(&w.hwnd)
+        });
+
+        let monogram = if pinned.monogram.trim().is_empty() {
+            make_monogram(&pinned.title)
+        } else {
+            pinned.monogram.clone()
+        };
+
+        if let Some(w) = matching_win {
+            matched_hwnds.insert(w.hwnd);
+            let item_id = table.register(w.hwnd);
+            items.push(TaskbarAppItem {
+                item_id,
+                title: w.title.clone().into(),
+                monogram: monogram.into(),
+                is_running: true,
+                is_focused: w.is_focused,
+                is_minimized: w.is_minimized,
+                is_pinned: true,
+                launch_target: if w.executable_path.is_empty() {
+                    pinned.launch_target.clone().into()
+                } else {
+                    w.executable_path.clone().into()
+                },
+            });
+        } else {
+            items.push(TaskbarAppItem {
+                item_id: 0,
+                title: pinned.title.clone().into(),
+                monogram: monogram.into(),
+                is_running: false,
+                is_focused: false,
+                is_minimized: false,
+                is_pinned: true,
+                launch_target: pinned.launch_target.clone().into(),
+            });
+        }
+    }
+
+    for w in windows {
+        if matched_hwnds.contains(&w.hwnd) {
+            continue;
+        }
+        let label = if !w.process_name.is_empty() {
+            &w.process_name
+        } else {
+            &w.title
+        };
+        let item_id = table.register(w.hwnd);
+        items.push(TaskbarAppItem {
+            item_id,
+            title: w.title.clone().into(),
+            monogram: make_monogram(label).into(),
+            is_running: true,
+            is_focused: w.is_focused,
+            is_minimized: w.is_minimized,
+            is_pinned: false,
+            launch_target: w.executable_path.clone().into(),
+        });
+    }
+
+    items
+}
+
+/// Formats local wall-clock time (`HH:MM`), date (`DD MMM`), and returns seconds until next minute boundary.
+pub fn format_local_clock() -> (String, String, u64) {
+    #[cfg(windows)]
+    {
+        use windows::Win32::System::SystemInformation::GetLocalTime;
+        let st = unsafe { GetLocalTime() };
+        let month_name = match st.wMonth {
+            1 => "Jan",
+            2 => "Feb",
+            3 => "Mar",
+            4 => "Apr",
+            5 => "May",
+            6 => "Jun",
+            7 => "Jul",
+            8 => "Aug",
+            9 => "Sep",
+            10 => "Oct",
+            11 => "Nov",
+            12 => "Dec",
+            _ => "",
+        };
+        let time_str = format!("{:02}:{:02}", st.wHour, st.wMinute);
+        let date_str = format!("{} {}", st.wDay, month_name);
+        let secs_remaining = (60u64).saturating_sub(st.wSecond as u64).max(1);
+        (time_str, date_str, secs_remaining)
+    }
+
+    #[cfg(not(windows))]
+    {
+        ("12:00".to_string(), "Today".to_string(), 60)
+    }
+}
+
+/// Applies native Win32 window styles, DWM Mica backdrop, target-monitor positioning,
+/// and optionally installs dynamic display change / DPI change subclass monitoring.
+pub fn apply_taskbar_native_styles(
+    win: &TaskbarWindow,
+    monitor_target: &str,
+    install_subclass: bool,
+    on_display_change: Option<Arc<dyn Fn() + Send + Sync>>,
+) -> Option<isize> {
     use slint::winit_030::winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use slint::winit_030::winit::window::WindowLevel;
     use slint::winit_030::WinitWindowAccessor;
 
     let hwnd_opt = win
         .window()
+        .with_winit_window(|winit_window| {
+            // Sync winit's internal WindowFlags::ALWAYS_ON_TOP before applying Win32 styles so
+            // subsequent winit flag updates (e.g. show/hide/decorations) never clear WS_EX_TOPMOST.
+            winit_window.set_window_level(WindowLevel::AlwaysOnTop);
+            match winit_window.window_handle() {
+                Ok(handle) => match handle.as_raw() {
+                    RawWindowHandle::Win32(win32) => Some(win32.hwnd.get()),
+                    _ => None,
+                },
+                Err(_) => None,
+            }
+        })
+        .flatten();
+
+    if let Some(hwnd) = hwnd_opt {
+        if let Err(e) = platform_windows::apply_dark_mode_and_backdrop(
+            hwnd,
+            platform_windows::DwmBackdropType::Mica,
+        ) {
+            tracing::warn!(error = %e, "DWM Mica application returned fallback");
+        }
+
+        if let Err(e) = platform_windows::configure_taskbar_native_styles(hwnd) {
+            tracing::warn!(error = %e, "Failed to configure native taskbar window styles");
+        }
+
+        if let Err(e) =
+            platform_windows::reposition_taskbar_on_monitor(hwnd, monitor_target, 720, 48)
+        {
+            tracing::warn!(
+                error = %e,
+                monitor_target,
+                "Failed to position taskbar on target monitor"
+            );
+        }
+
+        if install_subclass {
+            if let Err(e) = platform_windows::install_display_change_subclass_with_callback(
+                hwnd,
+                monitor_target,
+                720,
+                48,
+                on_display_change,
+                None,
+            ) {
+                tracing::warn!(error = %e, "Failed to install display change subclass");
+            }
+        }
+    }
+
+    hwnd_opt
+}
+
+fn wire_taskbar_callbacks(
+    win: &TaskbarWindow,
+    hwnd_table: &Arc<std::sync::Mutex<HwndHandleTable>>,
+) {
+    win.on_search_clicked(|| {
+        tracing::info!("Taskbar search pill clicked");
+        launch_app_target(&resolve_sibling_executable("search-ui.exe"));
+    });
+
+    {
+        let table_click = hwnd_table.clone();
+        win.on_item_clicked(
+            move |item_id, is_focused, is_minimized, launch_target_str| {
+                let hwnd_opt = table_click.lock().ok().and_then(|t| t.resolve(item_id));
+                if let Some(hwnd) = hwnd_opt {
+                    if let Err(e) = window_tracker::toggle_window(hwnd, is_focused, is_minimized) {
+                        tracing::warn!(hwnd, error = %e, "Failed to toggle tracked window");
+                    }
+                } else {
+                    launch_app_target(launch_target_str.as_str());
+                }
+            },
+        );
+    }
+
+    win.on_item_middle_clicked(|launch_target_str| {
+        launch_app_target(launch_target_str.as_str());
+    });
+
+    {
+        let table_rclick = hwnd_table.clone();
+        let win_weak_rclick = win.as_weak();
+        win.on_item_right_clicked(move |item_id, title| {
+            let Some(target_hwnd) = table_rclick.lock().ok().and_then(|t| t.resolve(item_id))
+            else {
+                return;
+            };
+            let owner_hwnd = win_weak_rclick
+                .upgrade()
+                .and_then(|w| extract_win32_hwnd(&w))
+                .unwrap_or(0);
+
+            match platform_windows::show_window_item_context_menu(owner_hwnd) {
+                Ok(platform_windows::WindowMenuAction::Activate) => {
+                    let _ = window_tracker::activate_window(target_hwnd);
+                }
+                Ok(platform_windows::WindowMenuAction::Minimize) => {
+                    let _ = window_tracker::minimize_window(target_hwnd);
+                }
+                Ok(platform_windows::WindowMenuAction::Close) => {
+                    tracing::info!(
+                        target_hwnd,
+                        title = %title,
+                        "Closing tracked window via taskbar context menu"
+                    );
+                    let _ = window_tracker::close_window(target_hwnd);
+                }
+                Ok(platform_windows::WindowMenuAction::None) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to show taskbar item context menu");
+                }
+            }
+        });
+    }
+
+    win.on_volume_clicked(|| {
+        launch_app_target("ms-settings:sound");
+    });
+
+    win.on_network_clicked(|| {
+        launch_app_target("ms-settings:network");
+    });
+}
+
+fn resolve_sibling_executable(name: &str) -> String {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join(name);
+            if candidate.exists() {
+                return candidate.to_string_lossy().to_string();
+            }
+        }
+    }
+    name.to_string()
+}
+fn launch_app_target(target: &str) {
+    if target.trim().is_empty() {
+        return;
+    }
+    let launch = if target.contains(':') && !target.contains('\\') {
+        shell_api::LaunchTarget::Uri {
+            uri: target.to_string(),
+        }
+    } else {
+        shell_api::LaunchTarget::Executable {
+            path: target.to_string(),
+            arguments: Vec::new(),
+            working_directory: None,
+        }
+    };
+
+    if let Err(e) = shell_api::launch_target(&launch) {
+        tracing::warn!(target, error = %e, "Failed to launch taskbar app target");
+    }
+}
+
+/// Extracts the Win32 `HWND` (`isize`) from a Slint `TaskbarWindow`.
+fn extract_win32_hwnd(win: &TaskbarWindow) -> Option<isize> {
+    use slint::winit_030::winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use slint::winit_030::WinitWindowAccessor;
+
+    win.window()
         .with_winit_window(|winit_window| match winit_window.window_handle() {
             Ok(handle) => match handle.as_raw() {
                 RawWindowHandle::Win32(win32) => Some(win32.hwnd.get()),
@@ -131,15 +465,7 @@ pub fn apply_taskbar_native_styles(win: &TaskbarWindow) -> Option<isize> {
             },
             Err(_) => None,
         })
-        .flatten();
-
-    if let Some(hwnd) = hwnd_opt {
-        if let Err(e) = apply_native_taskbar_configuration(hwnd) {
-            tracing::warn!(error = %e, "Failed to apply native taskbar configuration");
-        }
-    }
-
-    hwnd_opt
+        .flatten()
 }
 
 /// Manages the supervisor connection lifecycle with bounded exponential backoff retry and reconnection.
@@ -147,6 +473,17 @@ pub async fn run_supervisor_connection_loop(
     pipe_address: String,
     is_running: Arc<AtomicBool>,
     shutdown_notify: Arc<tokio::sync::Notify>,
+) {
+    run_supervisor_connection_loop_with_toggle(pipe_address, is_running, shutdown_notify, None)
+        .await;
+}
+
+/// Manages the supervisor connection lifecycle and dispatches supervisor `ToggleTaskbarNotice` events.
+pub async fn run_supervisor_connection_loop_with_toggle(
+    pipe_address: String,
+    is_running: Arc<AtomicBool>,
+    shutdown_notify: Arc<tokio::sync::Notify>,
+    on_toggle_taskbar: Option<Arc<dyn Fn() + Send + Sync>>,
 ) {
     let mut attempt = 0u32;
     let initial_backoff = Duration::from_millis(100);
@@ -157,7 +494,7 @@ pub async fn run_supervisor_connection_loop(
 
         match transport::connect_pipe_client(&pipe_address).await {
             Ok(mut client) => {
-                attempt = 0; // Reset backoff upon successful transport connection
+                attempt = 0;
                 let handshake_req = RequestEnvelope {
                     request_id: 1,
                     request: IpcRequest::Handshake {
@@ -178,7 +515,6 @@ pub async fn run_supervisor_connection_loop(
                                 "Taskbar supervisor mutual handshake confirmed; entering supervised lifecycle"
                             );
 
-                            // Active connection loop: wait for supervisor shutdown notice or connection drop
                             loop {
                                 tokio::select! {
                                     _ = shutdown_notify.notified() => {
@@ -187,8 +523,8 @@ pub async fn run_supervisor_connection_loop(
                                     }
                                     incoming = transport::read_framed_message::<_, ResponseEnvelope>(&mut client) => {
                                         match incoming {
-                                            Ok(env) => {
-                                                if matches!(env.response, IpcResponse::ShutdownNotice) {
+                                            Ok(env) => match env.response {
+                                                IpcResponse::ShutdownNotice => {
                                                     tracing::info!("Supervisor sent ShutdownNotice; commencing graceful taskbar termination");
                                                     is_running.store(false, Ordering::SeqCst);
                                                     let _ = slint::invoke_from_event_loop(|| {
@@ -196,10 +532,17 @@ pub async fn run_supervisor_connection_loop(
                                                     });
                                                     return;
                                                 }
-                                            }
+                                                IpcResponse::ToggleTaskbarNotice => {
+                                                    tracing::info!("Supervisor sent ToggleTaskbarNotice; toggling taskbar visibility");
+                                                    if let Some(cb) = &on_toggle_taskbar {
+                                                        cb();
+                                                    }
+                                                }
+                                                _ => {}
+                                            },
                                             Err(e) => {
                                                 tracing::info!(error = %e, "Supervisor connection dropped; entering reconnection lifecycle");
-                                                break; // Breaks inner loop to trigger reconnection
+                                                break;
                                             }
                                         }
                                     }
@@ -228,20 +571,13 @@ pub async fn run_supervisor_connection_loop(
             break;
         }
 
-        // Calculate bounded exponential backoff with jitter
         attempt = attempt.saturating_add(1);
         let backoff_multiplier = 2u64.pow(attempt.min(5));
         let jitter_ms = (std::process::id() as u64).wrapping_mul(attempt as u64) % 50;
         let delay = (initial_backoff * backoff_multiplier as u32
             + Duration::from_millis(jitter_ms))
         .min(max_backoff);
-        tracing::debug!(
-            delay_ms = delay.as_millis(),
-            attempt,
-            "Waiting before supervisor reconnect attempt"
-        );
 
-        // Interruptible retry delay
         tokio::select! {
             _ = shutdown_notify.notified() => {
                 tracing::debug!("Shutdown notification interrupted reconnect backoff");
@@ -259,12 +595,13 @@ async fn main() -> Result<()> {
         default_level: "info",
     });
 
-    tracing::info!("AsterShell Taskbar (M3A Foundation) initializing...");
+    tracing::info!("AsterShell Taskbar initializing...");
 
     let args: Vec<String> = env::args().collect();
     let mut supervisor_pipe = default_pipe_address();
     let mut connect_supervisor = true;
     let mut is_test_child = false;
+    let mut cli_monitor: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -279,12 +616,20 @@ async fn main() -> Result<()> {
             "--test-child" => {
                 is_test_child = true;
             }
+            "--monitor" if i + 1 < args.len() => {
+                cli_monitor = Some(args[i + 1].clone());
+                i += 1;
+            }
             _ => {}
         }
         i += 1;
     }
 
-    // In test-child mode, connect to supervisor IPC, acknowledge handshake, and wait for shutdown/pipe break
+    let config = configuration::load_config_from_path(&configuration::default_config_path())
+        .unwrap_or_default();
+    let monitor_target = cli_monitor.unwrap_or(config.taskbar.monitor);
+    let pinned_apps = config.taskbar.pinned_apps;
+
     if is_test_child {
         tracing::info!(
             supervisor_pipe = %supervisor_pipe,
@@ -329,11 +674,8 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
-            } else {
-                tracing::warn!("Test-child failed to connect to supervisor pipe");
             }
         } else {
-            // Standalone test-child loop: stays alive in sleep loop until OS or Job Object terminates it (LIFECYCLE-01)
             loop {
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
@@ -342,20 +684,98 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    let primary_device_name = platform_windows::find_monitor_by_target(&monitor_target)
+        .map(|m| m.device_name)
+        .unwrap_or_else(|_| r"\\.\DISPLAY1".to_string());
+
     let is_running = Arc::new(AtomicBool::new(true));
+    let visibility_state = Arc::new(std::sync::Mutex::new(TaskbarVisibilityState::new(
+        &primary_device_name,
+    )));
     let shutdown_notify = Arc::new(tokio::sync::Notify::new());
 
-    // 1. Connect to ShellHost Supervisor via Named Pipe with reconnection (AC-M3A-01, SEC-01, INTEGRATION-01)
+    let main_window = TaskbarWindow::new().map_err(|e| {
+        astercore::AsterError::Platform(format!("Failed to create TaskbarWindow: {}", e))
+    })?;
+
+    // Track extra per-monitor TaskbarWindow instances on the Slint UI thread when monitor == "all"
+    thread_local! {
+        static EXTRA_SURFACES: std::cell::RefCell<Vec<(String, TaskbarWindow)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn apply_to_all_surfaces<F: Fn(&TaskbarWindow)>(main_win: &TaskbarWindow, f: F) {
+        f(main_win);
+        EXTRA_SURFACES.with(|cell| {
+            for (_, extra) in cell.borrow().iter() {
+                f(extra);
+            }
+        });
+    }
+
+    fn apply_visibility_to_all_surfaces(
+        main_win: &TaskbarWindow,
+        primary_target: &str,
+        visible: bool,
+    ) {
+        if visible {
+            let _ = main_win.show();
+            apply_taskbar_native_styles(main_win, primary_target, false, None);
+            EXTRA_SURFACES.with(|cell| {
+                for (dev, extra) in cell.borrow().iter() {
+                    let _ = extra.show();
+                    apply_taskbar_native_styles(extra, dev, false, None);
+                }
+            });
+        } else {
+            let _ = main_win.hide();
+            EXTRA_SURFACES.with(|cell| {
+                for (_, extra) in cell.borrow().iter() {
+                    let _ = extra.hide();
+                }
+            });
+        }
+    }
+
     if connect_supervisor {
         let is_running_sup = is_running.clone();
         let shutdown_notify_sup = shutdown_notify.clone();
         let sup_addr = supervisor_pipe.clone();
+        let win_weak_toggle = main_window.as_weak();
+        let vis_toggle = visibility_state.clone();
+        let is_running_toggle = is_running.clone();
+        let primary_target_toggle = monitor_target.clone();
+        let toggle_cb: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            if !is_running_toggle.load(Ordering::SeqCst) {
+                return;
+            }
+            let next_visible = match vis_toggle.lock() {
+                Ok(mut st) => st.toggle(),
+                Err(_) => return,
+            };
+            let w_weak = win_weak_toggle.clone();
+            let target_str = primary_target_toggle.clone();
+            let is_running_ui = is_running_toggle.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if !is_running_ui.load(Ordering::SeqCst) {
+                    return;
+                }
+                if let Some(win) = w_weak.upgrade() {
+                    apply_visibility_to_all_surfaces(&win, &target_str, next_visible);
+                }
+            });
+        });
         tokio::spawn(async move {
-            run_supervisor_connection_loop(sup_addr, is_running_sup, shutdown_notify_sup).await;
+            run_supervisor_connection_loop_with_toggle(
+                sup_addr,
+                is_running_sup,
+                shutdown_notify_sup,
+                Some(toggle_cb),
+            )
+            .await;
         });
     }
 
-    // 2. Handle Ctrl+C signal
     {
         let is_running_ctrl = is_running.clone();
         let shutdown_notify_ctrl = shutdown_notify.clone();
@@ -371,35 +791,439 @@ async fn main() -> Result<()> {
         });
     }
 
-    // 3. Instantiate and configure Slint Window
-    let main_window = TaskbarWindow::new().map_err(|e| {
-        astercore::AsterError::Platform(format!("Failed to create TaskbarWindow: {}", e))
-    })?;
+    let hwnd_table = Arc::new(std::sync::Mutex::new(HwndHandleTable::new()));
+    wire_taskbar_callbacks(&main_window, &hwnd_table);
 
     main_window.show().map_err(|e| {
         astercore::AsterError::Platform(format!("Failed to show TaskbarWindow: {}", e))
     })?;
 
-    // Initial native Win32 configuration
-    apply_taskbar_native_styles(&main_window);
-
-    // Re-verify styles and placement on short timer once Winit message pump starts
-    let win_weak = main_window.as_weak();
-    let timer = slint::Timer::default();
-    timer.start(
-        slint::TimerMode::SingleShot,
-        Duration::from_millis(50),
-        move || {
-            if let Some(win) = win_weak.upgrade() {
-                apply_taskbar_native_styles(&win);
+    fn reconcile_extra_surfaces(
+        primary_device: &str,
+        monitor_target: &str,
+        hwnd_table: &Arc<std::sync::Mutex<HwndHandleTable>>,
+        vis_state: &Arc<std::sync::Mutex<TaskbarVisibilityState>>,
+    ) {
+        if !matches!(
+            platform_windows::MonitorTargetMode::parse(monitor_target),
+            platform_windows::MonitorTargetMode::All
+        ) {
+            if let Ok(mut st) = vis_state.lock() {
+                let _ = st.reconcile(&[primary_device.to_string()]);
             }
-        },
+            EXTRA_SURFACES.with(|cell| {
+                for (_, w) in cell.borrow_mut().drain(..) {
+                    let _ = w.hide();
+                }
+            });
+            return;
+        }
+
+        let Ok(available) = platform_windows::enumerate_monitors() else {
+            return;
+        };
+        let desired_all = platform_windows::resolve_target_monitors("all", &available);
+        let desired_names: Vec<String> =
+            desired_all.iter().map(|m| m.device_name.clone()).collect();
+        let should_be_visible = vis_state
+            .lock()
+            .map(|mut st| {
+                let _ = st.reconcile(&desired_names);
+                st.visible
+            })
+            .unwrap_or(true);
+
+        let desired_extra: Vec<_> = desired_all
+            .into_iter()
+            .filter(|m| !m.device_name.eq_ignore_ascii_case(primary_device))
+            .collect();
+
+        EXTRA_SURFACES.with(|cell| {
+            let mut list = cell.borrow_mut();
+            let current_names: Vec<String> = list.iter().map(|(d, _)| d.clone()).collect();
+            let diff = platform_windows::reconcile_monitor_surfaces(&current_names, &desired_extra);
+
+            // Remove surfaces for disconnected monitors
+            list.retain(|(dev, win)| {
+                let keep = !diff.to_remove.iter().any(|r| r.eq_ignore_ascii_case(dev));
+                if !keep {
+                    let _ = win.hide();
+                }
+                keep
+            });
+
+            // Reposition surviving surfaces and preserve authoritative visibility
+            for m in &diff.to_keep {
+                if let Some((_, win)) = list
+                    .iter()
+                    .find(|(d, _)| d.eq_ignore_ascii_case(&m.device_name))
+                {
+                    if should_be_visible {
+                        let _ = win.show();
+                        apply_taskbar_native_styles(win, &m.device_name, false, None);
+                    } else {
+                        let _ = win.hide();
+                    }
+                }
+            }
+
+            // Spawn new surfaces for newly attached monitors respecting authoritative visibility
+            for m in &diff.to_add {
+                if let Ok(extra_win) = TaskbarWindow::new() {
+                    wire_taskbar_callbacks(&extra_win, hwnd_table);
+                    if should_be_visible {
+                        if extra_win.show().is_ok() {
+                            if apply_taskbar_native_styles(&extra_win, &m.device_name, false, None)
+                                .is_none()
+                            {
+                                let extra_weak = extra_win.as_weak();
+                                let dev_name = m.device_name.clone();
+                                let retry_timer = slint::Timer::default();
+                                let attempts = std::rc::Rc::new(std::cell::Cell::new(0u8));
+                                let timer_slot =
+                                    std::rc::Rc::new(std::cell::RefCell::new(Some(retry_timer)));
+                                let timer_slot_cb = timer_slot.clone();
+                                if let Some(t) = timer_slot.borrow().as_ref() {
+                                    t.start(
+                                        slint::TimerMode::Repeated,
+                                        Duration::from_millis(25),
+                                        move || {
+                                            let n = attempts.get().saturating_add(1);
+                                            attempts.set(n);
+                                            let done = match extra_weak.upgrade() {
+                                                Some(w) => {
+                                                    apply_taskbar_native_styles(
+                                                        &w, &dev_name, false, None,
+                                                    )
+                                                    .is_some()
+                                                        || n >= 40
+                                                }
+                                                None => true,
+                                            };
+                                            if done {
+                                                if let Some(t_inner) =
+                                                    timer_slot_cb.borrow_mut().take()
+                                                {
+                                                    t_inner.stop();
+                                                }
+                                            }
+                                        },
+                                    );
+                                };
+                            }
+                            list.push((m.device_name.clone(), extra_win));
+                        }
+                    } else {
+                        let _ = extra_win.hide();
+                        list.push((m.device_name.clone(), extra_win));
+                    }
+                }
+            }
+        });
+    }
+
+    let display_change_cb: Arc<dyn Fn() + Send + Sync> = {
+        let primary_dev = primary_device_name.clone();
+        let target_cfg = monitor_target.clone();
+        let table_dc = hwnd_table.clone();
+        let vis_dc = visibility_state.clone();
+        Arc::new(move || {
+            let p_dev = primary_dev.clone();
+            let t_cfg = target_cfg.clone();
+            let tbl = table_dc.clone();
+            let vis = vis_dc.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                reconcile_extra_surfaces(&p_dev, &t_cfg, &tbl, &vis);
+            });
+        })
+    };
+
+    let _hwnd_opt = apply_taskbar_native_styles(
+        &main_window,
+        &monitor_target,
+        true,
+        Some(display_change_cb.clone()),
     );
+    reconcile_extra_surfaces(
+        &primary_device_name,
+        &monitor_target,
+        &hwnd_table,
+        &visibility_state,
+    );
+
+    // Register Win+Alt+T keyboard navigation hotkey (M3E)
+    let _taskbar_hotkey = {
+        let win_weak_hk = main_window.as_weak();
+        match register_global_hotkey(
+            HotkeyConfig {
+                alt: true,
+                ctrl: false,
+                shift: false,
+                win: true,
+                no_repeat: true,
+                vk_code: 0x54, // 'T'
+            },
+            move || {
+                let win_weak_inner = win_weak_hk.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    use slint::winit_030::winit::raw_window_handle::{
+                        HasWindowHandle, RawWindowHandle,
+                    };
+                    use slint::winit_030::WinitWindowAccessor;
+                    if let Some(win) = win_weak_inner.upgrade() {
+                        win.set_selected_index(0);
+                        let hwnd_opt = win
+                            .window()
+                            .with_winit_window(|w| match w.window_handle() {
+                                Ok(h) => match h.as_raw() {
+                                    RawWindowHandle::Win32(w32) => Some(w32.hwnd.get()),
+                                    _ => None,
+                                },
+                                Err(_) => None,
+                            })
+                            .flatten();
+                        if let Some(hwnd) = hwnd_opt {
+                            let _ = window_tracker::activate_window(hwnd);
+                        }
+                    }
+                });
+            },
+        ) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                tracing::debug!(error = %e, "Win+Alt+T hotkey registration skipped");
+                None
+            }
+        }
+    };
+
+    // Start Minute-Boundary Aligned Clock Task (M3E)
+    {
+        let (init_time, init_date, _) = format_local_clock();
+        main_window.set_clock_time(init_time.into());
+        main_window.set_clock_date(init_date.into());
+
+        let win_weak_clk = main_window.as_weak();
+        let is_running_clk = is_running.clone();
+        let shutdown_clk = shutdown_notify.clone();
+        tokio::spawn(async move {
+            while is_running_clk.load(Ordering::SeqCst) {
+                let (t_str, d_str, secs_until_next) = format_local_clock();
+                let win_inner = win_weak_clk.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(win) = win_inner.upgrade() {
+                        apply_to_all_surfaces(&win, |s| {
+                            s.set_clock_time(t_str.clone().into());
+                            s.set_clock_date(d_str.clone().into());
+                        });
+                    }
+                });
+
+                tokio::select! {
+                    _ = shutdown_clk.notified() => break,
+                    _ = tokio::time::sleep(Duration::from_secs(secs_until_next)) => {}
+                }
+            }
+        });
+    }
+
+    // Start Event-Driven System Indicators (M3E)
+    let _audio_monitor = match AudioMonitorHandle::start() {
+        Ok((handle, rx)) => {
+            let win_weak_a = main_window.as_weak();
+            std::thread::Builder::new()
+                .name("taskbar-audio-bridge".to_string())
+                .spawn(move || {
+                    while let Ok(state) = rx.recv() {
+                        let win_inner = win_weak_a.clone();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(win) = win_inner.upgrade() {
+                                let vol_str = format!("{}%", state.volume_percent);
+                                apply_to_all_surfaces(&win, |s| {
+                                    s.set_volume_text(vol_str.clone().into());
+                                    s.set_is_muted(state.is_muted);
+                                });
+                            }
+                        });
+                    }
+                })
+                .ok();
+            Some(handle)
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "Audio monitor unavailable");
+            None
+        }
+    };
+
+    let _network_monitor = match NetworkMonitorHandle::start() {
+        Ok((handle, rx)) => {
+            let win_weak_n = main_window.as_weak();
+            std::thread::Builder::new()
+                .name("taskbar-network-bridge".to_string())
+                .spawn(move || {
+                    while let Ok(status) = rx.recv() {
+                        let win_inner = win_weak_n.clone();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(win) = win_inner.upgrade() {
+                                apply_to_all_surfaces(&win, |s| {
+                                    s.set_network_label(status.label.clone().into());
+                                    s.set_network_connected(status.is_connected);
+                                });
+                            }
+                        });
+                    }
+                })
+                .ok();
+            Some(handle)
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "Network monitor unavailable");
+            None
+        }
+    };
+
+    let _power_monitor = match PowerMonitorHandle::start() {
+        Ok((handle, rx)) => {
+            let win_weak_p = main_window.as_weak();
+            std::thread::Builder::new()
+                .name("taskbar-power-bridge".to_string())
+                .spawn(move || {
+                    while let Ok(status) = rx.recv() {
+                        let win_inner = win_weak_p.clone();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(win) = win_inner.upgrade() {
+                                let text = if status.is_charging {
+                                    format!("+{}%", status.percent)
+                                } else {
+                                    format!("{}%", status.percent)
+                                };
+                                apply_to_all_surfaces(&win, |s| {
+                                    s.set_has_battery(status.has_battery);
+                                    s.set_battery_text(text.clone().into());
+                                });
+                            }
+                        });
+                    }
+                })
+                .ok();
+            Some(handle)
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "Power monitor unavailable");
+            None
+        }
+    };
+
+    // Start WinEvent-driven WindowTracker and bridge model to TaskbarWindow (M3C + M3E)
+    let _window_tracker = match window_tracker::WindowTracker::start() {
+        Ok((tracker, rx)) => {
+            let win_weak_tracker = main_window.as_weak();
+            let table_bridge = hwnd_table.clone();
+            let pinned_for_bridge = pinned_apps.clone();
+            std::thread::Builder::new()
+                .name("taskbar-window-bridge".to_string())
+                .spawn(move || {
+                    let mut state = window_tracker::WindowTrackerState::new();
+                    while let Ok(event) = rx.recv() {
+                        state.apply_event(event);
+                        let items = if let Ok(mut table) = table_bridge.lock() {
+                            build_taskbar_app_items(&state.windows, &pinned_for_bridge, &mut table)
+                        } else {
+                            Vec::new()
+                        };
+                        let win_weak_inner = win_weak_tracker.clone();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(win) = win_weak_inner.upgrade() {
+                                apply_to_all_surfaces(&win, |s| {
+                                    let model = std::rc::Rc::new(VecModel::from(items.clone()));
+                                    s.set_app_items(ModelRc::from(model));
+                                });
+                            }
+                        });
+                    }
+                })
+                .ok();
+            Some(tracker)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to start WindowTracker; continuing without window tracking");
+            None
+        }
+    };
+
+    // Apply native styles, display-change subclass, and extra-surface styling once Winit's event
+    // loop realizes the HWND (which happens after `slint::run_event_loop()` starts), then re-verify
+    // after initial frame property sync so WS_EX_TOPMOST is never cleared by winit/Slint.
+    let win_weak = main_window.as_weak();
+    let target_for_timer = monitor_target.clone();
+    let primary_dev_timer = primary_device_name.clone();
+    let table_timer = hwnd_table.clone();
+    let vis_timer = visibility_state.clone();
+    let display_cb_timer = display_change_cb.clone();
+    let init_attempts = std::rc::Rc::new(std::cell::Cell::new(0u8));
+    let timer_holder = std::rc::Rc::new(std::cell::RefCell::new(Some(slint::Timer::default())));
+    let timer_holder_cb = timer_holder.clone();
+    if let Some(timer) = timer_holder.borrow().as_ref() {
+        timer.start(
+            slint::TimerMode::Repeated,
+            Duration::from_millis(25),
+            move || {
+                let n = init_attempts.get().saturating_add(1);
+                init_attempts.set(n);
+                let mut realized = false;
+                if let Some(win) = win_weak.upgrade() {
+                    if apply_taskbar_native_styles(
+                        &win,
+                        &target_for_timer,
+                        true,
+                        Some(display_cb_timer.clone()),
+                    )
+                    .is_some()
+                    {
+                        realized = true;
+                        reconcile_extra_surfaces(
+                            &primary_dev_timer,
+                            &target_for_timer,
+                            &table_timer,
+                            &vis_timer,
+                        );
+                        let win_post = win.as_weak();
+                        let target_post = target_for_timer.clone();
+                        let vis_post = vis_timer.clone();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            let should_be_visible =
+                                vis_post.lock().map(|st| st.visible).unwrap_or(true);
+                            if should_be_visible {
+                                if let Some(w) = win_post.upgrade() {
+                                    apply_taskbar_native_styles(&w, &target_post, false, None);
+                                    EXTRA_SURFACES.with(|cell| {
+                                        for (dev, extra) in cell.borrow().iter() {
+                                            apply_taskbar_native_styles(extra, dev, false, None);
+                                        }
+                                    });
+                                }
+                            }
+                        });
+                    }
+                } else {
+                    realized = true;
+                }
+                if realized || n >= 40 {
+                    if let Some(t) = timer_holder_cb.borrow_mut().take() {
+                        t.stop();
+                    }
+                }
+            },
+        );
+    }
 
     tracing::info!("Starting Slint UI event loop for AsterTaskbar...");
     slint::run_event_loop()
         .map_err(|e| astercore::AsterError::Platform(format!("Slint event loop error: {}", e)))?;
 
+    is_running.store(false, Ordering::SeqCst);
+    shutdown_notify.notify_waiters();
     tracing::info!("AsterShell Taskbar exited cleanly.");
     Ok(())
 }
@@ -413,6 +1237,94 @@ mod tests {
         assert_eq!(ComponentId::Taskbar.as_str(), "taskbar");
     }
 
+    #[test]
+    fn test_build_taskbar_app_items_merges_pinned_and_running() {
+        let windows = vec![
+            WindowInfo {
+                hwnd: 1001,
+                title: "Windows Terminal".to_string(),
+                class_name: "CASCADIA_HOSTING_WINDOW_CLASS".to_string(),
+                pid: 4200,
+                process_name: "windowsterminal".to_string(),
+                executable_path: r"C:\wt.exe".to_string(),
+                is_minimized: false,
+                is_focused: true,
+                monitor_hmonitor: 1,
+            },
+            WindowInfo {
+                hwnd: 2002,
+                title: "Cargo Build".to_string(),
+                class_name: "ConsoleWindowClass".to_string(),
+                pid: 5100,
+                process_name: "code".to_string(),
+                executable_path: r"C:\code.exe".to_string(),
+                is_minimized: false,
+                is_focused: false,
+                monitor_hmonitor: 1,
+            },
+        ];
+
+        let mut table = HwndHandleTable::new();
+        let pins = configuration::default_pinned_apps();
+        let items = build_taskbar_app_items(&windows, &pins, &mut table);
+        // 4 default pinned + 1 unpinned running ("code") = 5
+        assert_eq!(items.len(), 5);
+
+        let wt = items
+            .iter()
+            .find(|i| i.is_running && i.monogram == "WT")
+            .expect("Matched pinned WT");
+        assert!(wt.is_pinned);
+        assert!(wt.is_focused);
+        assert_eq!(table.resolve(wt.item_id), Some(1001));
+
+        let code = items
+            .iter()
+            .find(|i| i.is_running && i.monogram == "CO")
+            .expect("Unpinned code");
+        assert!(!code.is_pinned);
+        assert!(!code.is_focused);
+        assert_eq!(table.resolve(code.item_id), Some(2002));
+    }
+
+    #[test]
+    fn test_hwnd_pointer_width_preserved_above_i32_max() {
+        let mut table = HwndHandleTable::new();
+        let large_hwnd: isize = 0x0000_0001_8000_1234isize;
+        let windows = vec![WindowInfo {
+            hwnd: large_hwnd,
+            title: "64-bit Window".to_string(),
+            class_name: "Test64".to_string(),
+            pid: 9999,
+            process_name: "win64app".to_string(),
+            executable_path: r"C:\win64app.exe".to_string(),
+            is_minimized: false,
+            is_focused: true,
+            monitor_hmonitor: 1,
+        }];
+
+        let pins = configuration::default_pinned_apps();
+        let items = build_taskbar_app_items(&windows, &pins, &mut table);
+        let item = items
+            .iter()
+            .find(|i| i.is_running)
+            .expect("Must track 64-bit HWND window");
+        assert_eq!(
+            table.resolve(item.item_id),
+            Some(large_hwnd),
+            "Full pointer-width HWND must round-trip without i32 truncation"
+        );
+    }
+
+    #[test]
+    fn test_format_local_clock_valid_ranges() {
+        let (time_str, date_str, secs) = format_local_clock();
+        assert_eq!(time_str.len(), 5);
+        assert!(time_str.contains(':'));
+        assert!(!date_str.is_empty());
+        assert!((1..=60).contains(&secs));
+    }
+
     #[cfg(windows)]
     #[tokio::test]
     async fn test_supervisor_connection_loop_lifecycle_and_cancellation() {
@@ -424,23 +1336,19 @@ mod tests {
         let shutdown_notify_clone = shutdown_notify.clone();
         let pipe_addr = test_pipe.clone();
 
-        // 1. Start connection loop before server exists (tests initial backoff retry)
         let loop_handle = tokio::spawn(async move {
             run_supervisor_connection_loop(pipe_addr, is_running_clone, shutdown_notify_clone)
                 .await;
         });
 
-        // Allow at least one transient connection failure / backoff wait
         tokio::time::sleep(Duration::from_millis(150)).await;
 
-        // 2. Now start server and bind
         let server = transport::create_pipe_server_with_security(&test_pipe, true, None)
             .expect("create server");
 
         let server_task = tokio::spawn(async move {
             if server.connect().await.is_ok() {
                 let mut stream = server;
-                // Read handshake
                 let req_res: astercore::Result<RequestEnvelope> =
                     transport::read_framed_message(&mut stream).await;
                 if let Ok(req) = req_res {
@@ -454,7 +1362,6 @@ mod tests {
                     };
                     let _ = transport::write_framed_message(&mut stream, &resp).await;
 
-                    // Send ShutdownNotice to gracefully terminate connection
                     tokio::time::sleep(Duration::from_millis(50)).await;
                     let notice = ResponseEnvelope {
                         request_id: 0,
@@ -490,7 +1397,6 @@ mod tests {
                 .await;
         });
 
-        // Cancel during backoff wait
         tokio::time::sleep(Duration::from_millis(150)).await;
         is_running.store(false, Ordering::SeqCst);
         shutdown_notify.notify_waiters();
@@ -501,5 +1407,78 @@ mod tests {
             start.elapsed() < Duration::from_secs(2),
             "Cancellation must promptly abort backoff"
         );
+    }
+
+    #[test]
+    fn test_visibility_single_monitor_and_repeated_toggles() {
+        let mut vis = TaskbarVisibilityState::new(r"\\.\DISPLAY1");
+        assert!(vis.visible);
+        assert_eq!(
+            vis.surface_visibility_targets(),
+            vec![(r"\\.\DISPLAY1".to_string(), true)]
+        );
+
+        assert!(!vis.toggle());
+        assert_eq!(
+            vis.surface_visibility_targets(),
+            vec![(r"\\.\DISPLAY1".to_string(), false)]
+        );
+
+        assert!(vis.toggle());
+        assert!(!vis.toggle());
+        assert!(vis.toggle());
+        assert_eq!(vis.surfaces.len(), 1);
+        assert!(vis.visible);
+    }
+
+    #[test]
+    fn test_visibility_all_monitor_sync_and_topology_while_hidden() {
+        let mut vis = TaskbarVisibilityState::new(r"\\.\DISPLAY1");
+        let plan_init = vis.reconcile(&[r"\\.\DISPLAY1".to_string(), r"\\.\DISPLAY2".to_string()]);
+        assert_eq!(plan_init.to_add, vec![(r"\\.\DISPLAY2".to_string(), true)]);
+
+        // Hide all surfaces
+        assert!(!vis.toggle());
+        assert_eq!(
+            vis.surface_visibility_targets(),
+            vec![
+                (r"\\.\DISPLAY1".to_string(), false),
+                (r"\\.\DISPLAY2".to_string(), false),
+            ]
+        );
+
+        // Attach DISPLAY3 while hidden: must be added with visible=false, never unexpectedly shown
+        let plan_add_hidden = vis.reconcile(&[
+            r"\\.\DISPLAY1".to_string(),
+            r"\\.\DISPLAY2".to_string(),
+            r"\\.\DISPLAY3".to_string(),
+        ]);
+        assert_eq!(
+            plan_add_hidden.to_add,
+            vec![(r"\\.\DISPLAY3".to_string(), false)]
+        );
+
+        // Remove DISPLAY2 while hidden
+        let plan_rm = vis.reconcile(&[r"\\.\DISPLAY1".to_string(), r"\\.\DISPLAY3".to_string()]);
+        assert_eq!(plan_rm.to_remove, vec![r"\\.\DISPLAY2".to_string()]);
+
+        // Restore all surviving surfaces
+        assert!(vis.toggle());
+        assert_eq!(
+            vis.surface_visibility_targets(),
+            vec![
+                (r"\\.\DISPLAY1".to_string(), true),
+                (r"\\.\DISPLAY3".to_string(), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_visibility_missing_or_destroyed_surface_handling() {
+        let mut vis = TaskbarVisibilityState::new(r"\\.\DISPLAY1");
+        let _ = vis.reconcile(&[r"\\.\DISPLAY1".to_string(), r"\\.\DISPLAY2".to_string()]);
+        vis.mark_destroyed(r"\\.\DISPLAY2");
+        vis.mark_destroyed(r"\\.\NONEXISTENT");
+        assert_eq!(vis.surfaces, vec![r"\\.\DISPLAY1".to_string()]);
     }
 }

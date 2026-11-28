@@ -75,3 +75,12 @@ filesystem = { path = "crates/filesystem" }
 configuration = { path = "crates/configuration" }
 ui-components = { path = "crates/ui-components" }
 diagnostics = { path = "crates/diagnostics" }
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = 0
+
+[profile.release]
+strip = "debuginfo"

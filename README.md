@@ -15,7 +15,7 @@ AsterShell is engineered to reimagine the Windows desktop experience. Built with
 
 ### Key Capabilities:
 - **Spotlight-Style Hybrid Search:** Instant, sub-100ms global search (`Alt + Space`) unifying Windows Search indexed files, installed applications, fast math evaluation, and quick commands.
-- **Modern Docked Taskbar:** Resilient, multi-monitor AppBar with live DWM window previews, pinned shortcuts, and zero OS bloat.
+- **Floating Companion Taskbar:** Multi-monitor floating companion window (`WS_POPUP | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE`) with live WinEvent window tracking, pinned/running apps, and zero-polling system indicators (without modifying Windows Explorer or the desktop work area).
 - **Fast Application Launcher:** Clean, keyboard-first Start experience reading the unified Windows application namespace.
 - **Supervised Multi-Process Architecture:** Independent processes (`shell-host`, `taskbar`, `search-ui`, `start-menu`, `desktop`) orchestrated by a persistent supervisor with kernel-enforced crash recovery.
 - **Dual Deployment Flexibility:** Operates seamlessly in **Companion Mode** alongside Windows Explorer, with an optional path toward **Full Shell Replacement**.
@@ -38,7 +38,7 @@ AsterShell is engineered to reimagine the Windows desktop experience. Built with
              v                    v                       v                    v
        +-----------+        +-----------+           +-----------+        +-----------+
        |  taskbar  |        | search-ui |           |start-menu |        |  desktop  |
-       |  (AppBar) |        | (Alt+Space|           | (Launcher)|        | (Surface) |
+       |(Companion)|        | (Alt+Space|           | (Launcher)|        | (Surface) |
        +-----------+        +-----------+           +-----------+        +-----------+
 ```
 
@@ -92,10 +92,10 @@ AsterShell strictly adheres to a **Zero Shell Mutation Policy** during standard 
 - **Milestone 1B:** Search Infrastructure & Hybrid Indexing ✅
 - **Milestone 2:** Spotlight Interface (`search-ui`) ✅
 - **Milestone 2.1:** Security Remediation & Publication ✅
-- **Milestone 3:** Custom Taskbar & System Tray Integration (Architecture Approved)
-- **Milestone 4:** Start Menu & App Launcher
-- **Milestone 5:** Desktop Canvas & Workspace Management
-- **Milestone 6:** Full Shell Replacement & Recovery Watchdog
+- **Milestone 3:** Custom Taskbar & System Tray Integration (Daily-Driver Candidate) ✅
+- **Milestone 4:** Start Menu & App Launcher (Future)
+- **Milestone 5:** Desktop Canvas & Workspace Management (Future)
+- **Milestone 6:** Full Shell Replacement & Recovery Watchdog (Future)
 
 See [ROADMAP.md](ROADMAP.md) for detailed milestone acceptance criteria.
 

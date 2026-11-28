@@ -39,6 +39,12 @@ impl Config {
                 "Search max_results must be between 1 and 100".into(),
             ));
         }
+        if self.taskbar.monitor.trim().is_empty() {
+            return Err(AsterError::Config(
+                "Taskbar monitor target cannot be empty".into(),
+            ));
+        }
+        validate_pinned_apps(&self.taskbar.pinned_apps)?;
         Ok(())
     }
 }
@@ -96,13 +102,114 @@ fn default_true() -> bool {
     true
 }
 
+fn default_monitor() -> String {
+    "primary".into()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PinnedAppConfig {
+    pub process_key: String,
+    pub title: String,
+    pub monogram: String,
+    pub launch_target: String,
+}
+
+pub fn default_pinned_apps() -> Vec<PinnedAppConfig> {
+    vec![
+        PinnedAppConfig {
+            process_key: "explorer".into(),
+            title: "File Explorer".into(),
+            monogram: "FE".into(),
+            launch_target: "explorer.exe".into(),
+        },
+        PinnedAppConfig {
+            process_key: "windowsterminal".into(),
+            title: "Terminal".into(),
+            monogram: "WT".into(),
+            launch_target: "wt.exe".into(),
+        },
+        PinnedAppConfig {
+            process_key: "msedge".into(),
+            title: "Edge".into(),
+            monogram: "ED".into(),
+            launch_target: "msedge.exe".into(),
+        },
+        PinnedAppConfig {
+            process_key: "notepad".into(),
+            title: "Notepad".into(),
+            monogram: "NP".into(),
+            launch_target: "notepad.exe".into(),
+        },
+    ]
+}
+
+/// Validates pinned application entries to prevent duplicate pins and arbitrary command injection.
+pub fn validate_pinned_apps(pins: &[PinnedAppConfig]) -> Result<()> {
+    let mut seen_keys = std::collections::HashSet::new();
+    let mut seen_targets = std::collections::HashSet::new();
+    const FORBIDDEN_CHARS: &[char] = &[';', '&', '|', '>', '<', '`', '$', '\n', '\r', '"'];
+
+    for (idx, pin) in pins.iter().enumerate() {
+        let key = pin.process_key.trim();
+        let title = pin.title.trim();
+        let target = pin.launch_target.trim();
+
+        if key.is_empty() || title.is_empty() || target.is_empty() {
+            return Err(AsterError::Config(format!(
+                "Pinned app at index {} has empty process_key, title, or launch_target",
+                idx
+            )));
+        }
+
+        if target.chars().any(|c| FORBIDDEN_CHARS.contains(&c)) {
+            return Err(AsterError::Config(format!(
+                "Pinned app '{}' contains forbidden shell metacharacters in target '{}'",
+                title, target
+            )));
+        }
+
+        let lower_target = target.to_ascii_lowercase();
+        if lower_target.contains(" /c ")
+            || lower_target.contains(" -command ")
+            || lower_target.starts_with("javascript:")
+            || lower_target.starts_with("vbscript:")
+            || lower_target.starts_with("data:")
+        {
+            return Err(AsterError::Config(format!(
+                "Pinned app '{}' uses an unsafe launch target '{}'",
+                title, target
+            )));
+        }
+
+        if !seen_keys.insert(key.to_ascii_lowercase()) {
+            return Err(AsterError::Config(format!(
+                "Duplicate pinned app process_key '{}'",
+                key
+            )));
+        }
+
+        if !seen_targets.insert(lower_target) {
+            return Err(AsterError::Config(format!(
+                "Duplicate pinned app launch_target '{}'",
+                target
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskbarConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
     pub position: String,
+    #[serde(default = "default_monitor")]
+    pub monitor: String,
     pub auto_hide: bool,
     pub live_thumbnails: bool,
+    #[serde(default = "default_pinned_apps")]
+    pub pinned_apps: Vec<PinnedAppConfig>,
 }
 
 impl Default for TaskbarConfig {
@@ -110,8 +217,10 @@ impl Default for TaskbarConfig {
         Self {
             enabled: true,
             position: "bottom".into(),
+            monitor: "primary".into(),
             auto_hide: false,
             live_thumbnails: true,
+            pinned_apps: default_pinned_apps(),
         }
     }
 }
@@ -200,6 +309,10 @@ mod tests {
         let mut config_bad_search = Config::default();
         config_bad_search.search.max_results = 0;
         assert!(config_bad_search.validate().is_err());
+
+        let mut config_bad_monitor = Config::default();
+        config_bad_monitor.taskbar.monitor = "   ".into();
+        assert!(config_bad_monitor.validate().is_err());
     }
 
     #[test]
@@ -234,5 +347,48 @@ mod tests {
         assert_eq!(loaded.general.hotkey, "Alt+Space");
 
         let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_pinned_apps_validation_and_backward_compat() {
+        // Legacy TOML without pinned_apps field still parses with defaults
+        let full_toml = toml::to_string(&Config::default()).expect("Serialize default config");
+        let legacy_toml = full_toml
+            .split("[[taskbar.pinned_apps]]")
+            .next()
+            .expect("Split before pinned_apps");
+        let parsed: Config = toml::from_str(legacy_toml).expect("Legacy TOML must parse");
+        assert_eq!(parsed.taskbar.pinned_apps.len(), 4);
+        assert!(parsed.validate().is_ok());
+
+        // Reject duplicate process_key
+        let mut dup_cfg = Config::default();
+        dup_cfg.taskbar.pinned_apps.push(PinnedAppConfig {
+            process_key: "notepad".into(),
+            title: "Notepad 2".into(),
+            monogram: "N2".into(),
+            launch_target: "notepad2.exe".into(),
+        });
+        assert!(dup_cfg.validate().is_err());
+
+        // Reject command injection / unsafe targets
+        for bad_target in [
+            "notepad.exe & calc.exe",
+            "cmd.exe /c whoami",
+            "javascript:alert(1)",
+        ] {
+            let mut bad_cfg = Config::default();
+            bad_cfg.taskbar.pinned_apps = vec![PinnedAppConfig {
+                process_key: "evil".into(),
+                title: "Evil".into(),
+                monogram: "EV".into(),
+                launch_target: bad_target.into(),
+            }];
+            assert!(
+                bad_cfg.validate().is_err(),
+                "Target '{}' must be rejected",
+                bad_target
+            );
+        }
     }
 }

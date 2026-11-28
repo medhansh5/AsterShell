@@ -1,18 +1,35 @@
 //! AsterShell Platform Layer — Windows API and System Abstractions
 
+pub mod audio;
 pub mod hotkey;
+pub mod monitor;
+pub mod network;
+pub mod power;
+pub mod tray;
 pub mod window;
 
+pub use audio::{query_master_volume, AudioMonitorHandle, AudioVolumeState};
 pub use hotkey::{register_global_hotkey, GlobalHotkeyHandle, HotkeyConfig, HotkeyError};
+pub use monitor::{
+    calculate_monitor_taskbar_coordinates, enumerate_monitors, find_monitor_by_target,
+    find_primary_monitor, install_display_change_subclass,
+    install_display_change_subclass_with_callback, reconcile_monitor_surfaces,
+    remove_display_change_subclass, reposition_taskbar_on_monitor, resolve_target_monitors,
+    MonitorInfo, MonitorSurfaceDiff, MonitorTargetMode,
+};
+pub use network::{query_network_status, NetworkMonitorHandle, NetworkStatus};
+pub use power::{query_power_status, PowerMonitorHandle, PowerStatus};
+pub use tray::{TrayAction, TrayIconHandle, ASTERSHELL_TRAY_GUID_U128};
 pub use window::{
     apply_dark_mode_and_backdrop, apply_native_taskbar_configuration,
     calculate_spotlight_coordinates, calculate_spotlight_coordinates_with_dpi,
     calculate_taskbar_coordinates_with_dpi, configure_taskbar_native_styles,
     get_active_monitor_work_area, get_primary_monitor_work_area, get_window_dpi, get_window_styles,
-    position_taskbar_window, position_window, scale_to_physical_pixels, DwmBackdropType, Rect,
-    WS_CAPTION_FLAG, WS_CLIPCHILDREN_FLAG, WS_CLIPSIBLINGS_FLAG, WS_EX_APPWINDOW_FLAG,
-    WS_EX_NOACTIVATE_FLAG, WS_EX_TOOLWINDOW_FLAG, WS_EX_TOPMOST_FLAG, WS_POPUP_FLAG,
-    WS_SYSMENU_FLAG, WS_THICKFRAME_FLAG, WS_VISIBLE_FLAG,
+    position_taskbar_window, position_window, scale_to_physical_pixels,
+    show_window_item_context_menu, DwmBackdropType, Rect, WindowMenuAction, WS_CAPTION_FLAG,
+    WS_CLIPCHILDREN_FLAG, WS_CLIPSIBLINGS_FLAG, WS_EX_APPWINDOW_FLAG, WS_EX_NOACTIVATE_FLAG,
+    WS_EX_TOOLWINDOW_FLAG, WS_EX_TOPMOST_FLAG, WS_POPUP_FLAG, WS_SYSMENU_FLAG, WS_THICKFRAME_FLAG,
+    WS_VISIBLE_FLAG,
 };
 
 use astercore::{AsterError, Result};

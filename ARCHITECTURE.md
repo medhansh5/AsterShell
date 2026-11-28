@@ -65,7 +65,7 @@ AsterShell is engineered from the ground up as a native, resilient, modular Wind
 | Application Binary | Role & Responsibility | Window Type / Mode | Failure Impact |
 | :--- | :--- | :--- | :--- |
 | **`shell-host`** | Persistent daemon and supervisor. Manages child processes, IPC broker, hotkey registration, configuration broadcast, and crash telemetry. | Headless (System Tray status icon) | If `shell-host` terminates, the Windows Job Object terminates child processes cleanly. |
-| **`taskbar`** | Modern docked taskbar. Displays pinned/running apps, window state, system clock, and status indicators. | `AppBar` docked window (`ABM_NEW`), HWND layered | Independent restart in < 50 ms. Work area preserved. |
+| **`taskbar`** | Floating companion taskbar. Displays configured pinned/running apps, window state, minute-synced clock, and zero-polling system indicators. | Floating `WS_POPUP` companion (`WS_EX_TOPMOST \| WS_EX_TOOLWINDOW \| WS_EX_NOACTIVATE`); zero AppBar or work-area mutation | Independent restart. Work area preserved. |
 | **`search-ui`** | Fast global search overlay triggered by `Alt + Space`. Instant fuzzy application matching, indexed file search, math evaluation. | Top-level frameless popup with DWM Mica / Acrylic | Independent restart. Disappears on blur. |
 | **`start-menu`** | Application launcher, categorized pinned items, power options, and user profile management. | Anchored modal flyout | Independent restart. Triggered on demand. |
 | **`desktop`** | Root desktop wallpaper surface, multi-monitor canvas, desktop icon grid, and selection rectangle. | Bottom-most layered window (`HWND_BOTTOM`) | Independent restart. Does not affect open application windows. |

@@ -414,10 +414,10 @@ pub fn configure_taskbar_native_styles(hwnd: isize) -> Result<(u32, u32)> {
         use windows::Win32::Foundation::HWND;
         use windows::Win32::UI::WindowsAndMessaging::{
             GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE, GWL_STYLE,
-            HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WS_CAPTION,
-            WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-            WS_EX_TOPMOST, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
-            WS_VISIBLE,
+            HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
+            WS_CAPTION, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_APPWINDOW, WS_EX_NOACTIVATE,
+            WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU,
+            WS_THICKFRAME, WS_VISIBLE,
         };
 
         let handle = HWND(hwnd as _);
@@ -445,19 +445,26 @@ pub fn configure_taskbar_native_styles(hwnd: isize) -> Result<(u32, u32)> {
             SetWindowLongPtrW(handle, GWL_EXSTYLE, target_ex_style as isize);
         }
 
-        // 5. Force frame update and HWND_TOPMOST without moving or stealing focus
+        // 5. Force frame update and HWND_TOPMOST without moving or stealing focus.
+        // Note: SetWindowLongPtrW(GWL_EXSTYLE) cannot set WS_EX_TOPMOST; only SetWindowPos(HWND_TOPMOST) does.
         unsafe {
             use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOWNA};
             let _ = ShowWindow(handle, SW_SHOWNA);
-            let _ = SetWindowPos(
+            if let Err(e) = SetWindowPos(
                 handle,
                 HWND_TOPMOST,
                 0,
                 0,
                 0,
                 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
-            );
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_SHOWWINDOW,
+            ) {
+                tracing::warn!(
+                    hwnd,
+                    error = %e,
+                    "SetWindowPos(HWND_TOPMOST) failed in configure_taskbar_native_styles"
+                );
+            }
         }
 
         // 6. Read back verified styles
@@ -466,15 +473,21 @@ pub fn configure_taskbar_native_styles(hwnd: isize) -> Result<(u32, u32)> {
 
         if (verified_ex_style & WS_EX_TOPMOST.0) == 0 {
             unsafe {
-                let _ = SetWindowPos(
+                if let Err(e) = SetWindowPos(
                     handle,
                     HWND_TOPMOST,
                     0,
                     0,
                     0,
                     0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
-                );
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                ) {
+                    tracing::warn!(
+                        hwnd,
+                        error = %e,
+                        "Retry SetWindowPos(HWND_TOPMOST) failed in configure_taskbar_native_styles"
+                    );
+                }
             }
             verified_ex_style = unsafe { GetWindowLongPtrW(handle, GWL_EXSTYLE) } as u32;
         }
@@ -560,7 +573,7 @@ pub fn apply_native_taskbar_configuration(hwnd: isize) -> Result<(u32, u32)> {
     }
 
     // 2. Configure native styles: WS_POPUP, WS_EX_TOPMOST, WS_EX_TOOLWINDOW, WS_EX_NOACTIVATE, !WS_EX_APPWINDOW
-    let (style, ex_style) = configure_taskbar_native_styles(hwnd)?;
+    let _ = configure_taskbar_native_styles(hwnd)?;
 
     // 3. Query DPI and calculate centered top coordinates on primary monitor
     let dpi = get_window_dpi(hwnd);
@@ -570,5 +583,90 @@ pub fn apply_native_taskbar_configuration(hwnd: isize) -> Result<(u32, u32)> {
         }
     }
 
-    Ok((style, ex_style))
+    get_window_styles(hwnd)
+}
+
+/// Action selected from a taskbar item's native right-click context menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowMenuAction {
+    None,
+    Activate,
+    Minimize,
+    Close,
+}
+
+/// Displays a native Win32 context menu at the cursor for a tracked taskbar window.
+///
+/// Uses `SetForegroundWindow` + `TPM_RETURNCMD` + `PostMessageW(WM_NULL)` so Escape,
+/// `WM_CANCELMODE`, focus loss, and click-outside dismiss the menu cleanly without
+/// triggering accidental actions.
+pub fn show_window_item_context_menu(owner_hwnd: isize) -> Result<WindowMenuAction> {
+    #[cfg(windows)]
+    {
+        use windows::core::{HSTRING, PCWSTR};
+        use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, PostMessageW,
+            SetForegroundWindow, TrackPopupMenuEx, MF_SEPARATOR, MF_STRING, TPM_BOTTOMALIGN,
+            TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_NULL,
+        };
+
+        const CMD_ACTIVATE: usize = 1;
+        const CMD_MINIMIZE: usize = 2;
+        const CMD_CLOSE: usize = 3;
+
+        let handle = HWND(owner_hwnd as _);
+        unsafe {
+            let hmenu = CreatePopupMenu()
+                .map_err(|e| AsterError::Platform(format!("CreatePopupMenu failed: {}", e)))?;
+
+            let activate_lbl = HSTRING::from("Activate / Restore");
+            let minimize_lbl = HSTRING::from("Minimize");
+            let close_lbl = HSTRING::from("Close Window");
+
+            let _ = AppendMenuW(
+                hmenu,
+                MF_STRING,
+                CMD_ACTIVATE,
+                PCWSTR(activate_lbl.as_ptr()),
+            );
+            let _ = AppendMenuW(
+                hmenu,
+                MF_STRING,
+                CMD_MINIMIZE,
+                PCWSTR(minimize_lbl.as_ptr()),
+            );
+            let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR::null());
+            let _ = AppendMenuW(hmenu, MF_STRING, CMD_CLOSE, PCWSTR(close_lbl.as_ptr()));
+
+            let mut pt = POINT::default();
+            let _ = GetCursorPos(&mut pt);
+
+            let _ = SetForegroundWindow(handle);
+            let cmd = TrackPopupMenuEx(
+                hmenu,
+                (TPM_LEFTALIGN | TPM_BOTTOMALIGN | TPM_RIGHTBUTTON | TPM_RETURNCMD).0,
+                pt.x,
+                pt.y,
+                handle,
+                None,
+            );
+            let _ = PostMessageW(handle, WM_NULL, WPARAM(0), LPARAM(0));
+            let _ = DestroyMenu(hmenu);
+
+            let action = match cmd.0 as usize {
+                CMD_ACTIVATE => WindowMenuAction::Activate,
+                CMD_MINIMIZE => WindowMenuAction::Minimize,
+                CMD_CLOSE => WindowMenuAction::Close,
+                _ => WindowMenuAction::None,
+            };
+            Ok(action)
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = owner_hwnd;
+        Ok(WindowMenuAction::None)
+    }
 }
