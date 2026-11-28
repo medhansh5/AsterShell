@@ -478,6 +478,79 @@ fn test_ac_m3a_02_and_03_real_slint_taskbar_window_native_styles() {
     );
 }
 
+#[cfg(windows)]
+#[test]
+fn test_f_p2_01_win32_hide_restore_preserves_native_styles() {
+    use platform_windows::{
+        configure_taskbar_native_styles, get_window_styles, WS_EX_APPWINDOW_FLAG,
+        WS_EX_NOACTIVATE_FLAG, WS_EX_TOOLWINDOW_FLAG, WS_EX_TOPMOST_FLAG, WS_POPUP_FLAG,
+    };
+    use windows::core::{HSTRING, PCWSTR};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DestroyWindow, ShowWindow, SW_HIDE, SW_SHOWNA, WS_EX_NOACTIVATE,
+        WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    };
+
+    let hwnd = unsafe {
+        CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            PCWSTR(HSTRING::from("STATIC").as_ptr()),
+            PCWSTR(HSTRING::from("AsterHideRestoreTest").as_ptr()),
+            WS_POPUP,
+            0,
+            0,
+            720,
+            48,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("CreateWindowExW for hide/restore test")
+    };
+
+    let hwnd_raw = hwnd.0 as isize;
+    let _ = configure_taskbar_native_styles(hwnd_raw).expect("Initial style config");
+
+    // Simulate hide then restore without stealing activation
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_HIDE);
+        let _ = ShowWindow(hwnd, SW_SHOWNA);
+    }
+
+    let (style, ex_style) =
+        configure_taskbar_native_styles(hwnd_raw).expect("Restore style config");
+    let (read_style, read_ex_style) = get_window_styles(hwnd_raw).expect("Read back styles");
+    assert_eq!(style, read_style);
+    assert_eq!(ex_style, read_ex_style);
+
+    assert_ne!(style & WS_POPUP_FLAG, 0, "WS_POPUP must be preserved");
+    assert_ne!(
+        ex_style & WS_EX_TOPMOST_FLAG,
+        0,
+        "WS_EX_TOPMOST must be preserved after restore"
+    );
+    assert_ne!(
+        ex_style & WS_EX_TOOLWINDOW_FLAG,
+        0,
+        "WS_EX_TOOLWINDOW must be preserved after restore"
+    );
+    assert_ne!(
+        ex_style & WS_EX_NOACTIVATE_FLAG,
+        0,
+        "WS_EX_NOACTIVATE must be preserved after restore"
+    );
+    assert_eq!(
+        ex_style & WS_EX_APPWINDOW_FLAG,
+        0,
+        "WS_EX_APPWINDOW must never be added on restore"
+    );
+
+    unsafe {
+        let _ = DestroyWindow(hwnd);
+    }
+}
+
 // ============================================================================
 // Category C: Real Process Containment & Supervisor Lifecycle Integration Tests
 // ============================================================================

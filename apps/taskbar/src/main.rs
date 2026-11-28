@@ -38,6 +38,81 @@ fn make_monogram(name: &str) -> String {
     }
 }
 
+/// Authoritative visibility state and surface topology tracker for single- and all-monitor modes.
+#[derive(Debug, Clone)]
+pub struct TaskbarVisibilityState {
+    pub visible: bool,
+    pub surfaces: Vec<String>,
+}
+
+/// Plan produced when reconciling active surfaces against desired monitor devices.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VisibilityReconcilePlan {
+    pub to_remove: Vec<String>,
+    pub to_keep: Vec<(String, bool)>,
+    pub to_add: Vec<(String, bool)>,
+}
+
+impl TaskbarVisibilityState {
+    pub fn new(primary_device: &str) -> Self {
+        Self {
+            visible: true,
+            surfaces: vec![primary_device.to_string()],
+        }
+    }
+
+    /// Flips the single authoritative visibility flag and returns the new target visibility.
+    pub fn toggle(&mut self) -> bool {
+        self.visible = !self.visible;
+        self.visible
+    }
+
+    /// Reconciles tracked monitor devices against `desired_devices`, preserving `self.visible`
+    /// for both surviving and newly added surfaces.
+    pub fn reconcile(&mut self, desired_devices: &[String]) -> VisibilityReconcilePlan {
+        let mut to_remove = Vec::new();
+        let mut to_keep = Vec::new();
+        let mut to_add = Vec::new();
+
+        for dev in &self.surfaces {
+            if !desired_devices.iter().any(|d| d.eq_ignore_ascii_case(dev)) {
+                to_remove.push(dev.clone());
+            }
+        }
+
+        self.surfaces
+            .retain(|dev| desired_devices.iter().any(|d| d.eq_ignore_ascii_case(dev)));
+
+        for dev in desired_devices {
+            if self.surfaces.iter().any(|d| d.eq_ignore_ascii_case(dev)) {
+                to_keep.push((dev.clone(), self.visible));
+            } else {
+                self.surfaces.push(dev.clone());
+                to_add.push((dev.clone(), self.visible));
+            }
+        }
+
+        VisibilityReconcilePlan {
+            to_remove,
+            to_keep,
+            to_add,
+        }
+    }
+
+    /// Removes a missing or destroyed surface cleanly without altering other surfaces.
+    pub fn mark_destroyed(&mut self, device: &str) {
+        self.surfaces.retain(|d| !d.eq_ignore_ascii_case(device));
+    }
+
+    /// Returns `(device_name, visible)` for all currently tracked surfaces.
+    pub fn surface_visibility_targets(&self) -> Vec<(String, bool)> {
+        self.surfaces
+            .iter()
+            .map(|d| (d.clone(), self.visible))
+            .collect()
+    }
+}
+
 /// Pointer-width-safe bidirectional table mapping 32-bit Slint UI `item_id`s
 /// to full 64-bit Win32 `isize` HWND handles without truncation.
 #[derive(Debug, Default)]
@@ -603,32 +678,84 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    let primary_device_name = platform_windows::find_monitor_by_target(&monitor_target)
+        .map(|m| m.device_name)
+        .unwrap_or_else(|_| r"\\.\DISPLAY1".to_string());
+
     let is_running = Arc::new(AtomicBool::new(true));
-    let is_visible = Arc::new(AtomicBool::new(true));
+    let visibility_state = Arc::new(std::sync::Mutex::new(TaskbarVisibilityState::new(
+        &primary_device_name,
+    )));
     let shutdown_notify = Arc::new(tokio::sync::Notify::new());
 
     let main_window = TaskbarWindow::new().map_err(|e| {
         astercore::AsterError::Platform(format!("Failed to create TaskbarWindow: {}", e))
     })?;
 
+    // Track extra per-monitor TaskbarWindow instances on the Slint UI thread when monitor == "all"
+    thread_local! {
+        static EXTRA_SURFACES: std::cell::RefCell<Vec<(String, TaskbarWindow)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn apply_to_all_surfaces<F: Fn(&TaskbarWindow)>(main_win: &TaskbarWindow, f: F) {
+        f(main_win);
+        EXTRA_SURFACES.with(|cell| {
+            for (_, extra) in cell.borrow().iter() {
+                f(extra);
+            }
+        });
+    }
+
+    fn apply_visibility_to_all_surfaces(
+        main_win: &TaskbarWindow,
+        primary_target: &str,
+        visible: bool,
+    ) {
+        if visible {
+            let _ = main_win.show();
+            apply_taskbar_native_styles(main_win, primary_target, false, None);
+            EXTRA_SURFACES.with(|cell| {
+                for (dev, extra) in cell.borrow().iter() {
+                    let _ = extra.show();
+                    apply_taskbar_native_styles(extra, dev, false, None);
+                }
+            });
+        } else {
+            let _ = main_win.hide();
+            EXTRA_SURFACES.with(|cell| {
+                for (_, extra) in cell.borrow().iter() {
+                    let _ = extra.hide();
+                }
+            });
+        }
+    }
+
     if connect_supervisor {
         let is_running_sup = is_running.clone();
         let shutdown_notify_sup = shutdown_notify.clone();
         let sup_addr = supervisor_pipe.clone();
         let win_weak_toggle = main_window.as_weak();
-        let is_visible_toggle = is_visible.clone();
+        let vis_toggle = visibility_state.clone();
+        let is_running_toggle = is_running.clone();
+        let primary_target_toggle = monitor_target.clone();
         let toggle_cb: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-            let currently_visible = is_visible_toggle.load(Ordering::SeqCst);
-            let next_visible = !currently_visible;
-            is_visible_toggle.store(next_visible, Ordering::SeqCst);
+            if !is_running_toggle.load(Ordering::SeqCst) {
+                return;
+            }
+            let next_visible = match vis_toggle.lock() {
+                Ok(mut st) => st.toggle(),
+                Err(_) => return,
+            };
             let w_weak = win_weak_toggle.clone();
+            let target_str = primary_target_toggle.clone();
+            let is_running_ui = is_running_toggle.clone();
             let _ = slint::invoke_from_event_loop(move || {
+                if !is_running_ui.load(Ordering::SeqCst) {
+                    return;
+                }
                 if let Some(win) = w_weak.upgrade() {
-                    if next_visible {
-                        let _ = win.show();
-                    } else {
-                        let _ = win.hide();
-                    }
+                    apply_visibility_to_all_surfaces(&win, &target_str, next_visible);
                 }
             });
         });
@@ -665,30 +792,19 @@ async fn main() -> Result<()> {
         astercore::AsterError::Platform(format!("Failed to show TaskbarWindow: {}", e))
     })?;
 
-    // Track extra per-monitor TaskbarWindow instances on the Slint UI thread when monitor == "all"
-    thread_local! {
-        static EXTRA_SURFACES: std::cell::RefCell<Vec<(String, TaskbarWindow)>> =
-            const { std::cell::RefCell::new(Vec::new()) };
-    }
-
-    fn apply_to_all_surfaces<F: Fn(&TaskbarWindow)>(main_win: &TaskbarWindow, f: F) {
-        f(main_win);
-        EXTRA_SURFACES.with(|cell| {
-            for (_, extra) in cell.borrow().iter() {
-                f(extra);
-            }
-        });
-    }
-
     fn reconcile_extra_surfaces(
         primary_device: &str,
         monitor_target: &str,
         hwnd_table: &Arc<std::sync::Mutex<HwndHandleTable>>,
+        vis_state: &Arc<std::sync::Mutex<TaskbarVisibilityState>>,
     ) {
         if !matches!(
             platform_windows::MonitorTargetMode::parse(monitor_target),
             platform_windows::MonitorTargetMode::All
         ) {
+            if let Ok(mut st) = vis_state.lock() {
+                let _ = st.reconcile(&[primary_device.to_string()]);
+            }
             EXTRA_SURFACES.with(|cell| {
                 for (_, w) in cell.borrow_mut().drain(..) {
                     let _ = w.hide();
@@ -700,7 +816,18 @@ async fn main() -> Result<()> {
         let Ok(available) = platform_windows::enumerate_monitors() else {
             return;
         };
-        let desired_extra: Vec<_> = platform_windows::resolve_target_monitors("all", &available)
+        let desired_all = platform_windows::resolve_target_monitors("all", &available);
+        let desired_names: Vec<String> =
+            desired_all.iter().map(|m| m.device_name.clone()).collect();
+        let should_be_visible = vis_state
+            .lock()
+            .map(|mut st| {
+                let _ = st.reconcile(&desired_names);
+                st.visible
+            })
+            .unwrap_or(true);
+
+        let desired_extra: Vec<_> = desired_all
             .into_iter()
             .filter(|m| !m.device_name.eq_ignore_ascii_case(primary_device))
             .collect();
@@ -719,22 +846,32 @@ async fn main() -> Result<()> {
                 keep
             });
 
-            // Reposition surviving surfaces
+            // Reposition surviving surfaces and preserve authoritative visibility
             for m in &diff.to_keep {
                 if let Some((_, win)) = list
                     .iter()
                     .find(|(d, _)| d.eq_ignore_ascii_case(&m.device_name))
                 {
-                    apply_taskbar_native_styles(win, &m.device_name, false, None);
+                    if should_be_visible {
+                        let _ = win.show();
+                        apply_taskbar_native_styles(win, &m.device_name, false, None);
+                    } else {
+                        let _ = win.hide();
+                    }
                 }
             }
 
-            // Spawn new surfaces for newly attached monitors
+            // Spawn new surfaces for newly attached monitors respecting authoritative visibility
             for m in &diff.to_add {
                 if let Ok(extra_win) = TaskbarWindow::new() {
                     wire_taskbar_callbacks(&extra_win, hwnd_table);
-                    if extra_win.show().is_ok() {
-                        apply_taskbar_native_styles(&extra_win, &m.device_name, false, None);
+                    if should_be_visible {
+                        if extra_win.show().is_ok() {
+                            apply_taskbar_native_styles(&extra_win, &m.device_name, false, None);
+                            list.push((m.device_name.clone(), extra_win));
+                        }
+                    } else {
+                        let _ = extra_win.hide();
                         list.push((m.device_name.clone(), extra_win));
                     }
                 }
@@ -742,27 +879,30 @@ async fn main() -> Result<()> {
         });
     }
 
-    let primary_device_name = platform_windows::find_monitor_by_target(&monitor_target)
-        .map(|m| m.device_name)
-        .unwrap_or_else(|_| r"\\.\DISPLAY1".to_string());
-
     let display_change_cb: Arc<dyn Fn() + Send + Sync> = {
         let primary_dev = primary_device_name.clone();
         let target_cfg = monitor_target.clone();
         let table_dc = hwnd_table.clone();
+        let vis_dc = visibility_state.clone();
         Arc::new(move || {
             let p_dev = primary_dev.clone();
             let t_cfg = target_cfg.clone();
             let tbl = table_dc.clone();
+            let vis = vis_dc.clone();
             let _ = slint::invoke_from_event_loop(move || {
-                reconcile_extra_surfaces(&p_dev, &t_cfg, &tbl);
+                reconcile_extra_surfaces(&p_dev, &t_cfg, &tbl, &vis);
             });
         })
     };
 
     let hwnd_opt =
         apply_taskbar_native_styles(&main_window, &monitor_target, true, Some(display_change_cb));
-    reconcile_extra_surfaces(&primary_device_name, &monitor_target, &hwnd_table);
+    reconcile_extra_surfaces(
+        &primary_device_name,
+        &monitor_target,
+        &hwnd_table,
+        &visibility_state,
+    );
 
     // Register Win+Alt+T keyboard navigation hotkey (M3E)
     let _taskbar_hotkey = {
@@ -1155,5 +1295,78 @@ mod tests {
             start.elapsed() < Duration::from_secs(2),
             "Cancellation must promptly abort backoff"
         );
+    }
+
+    #[test]
+    fn test_visibility_single_monitor_and_repeated_toggles() {
+        let mut vis = TaskbarVisibilityState::new(r"\\.\DISPLAY1");
+        assert!(vis.visible);
+        assert_eq!(
+            vis.surface_visibility_targets(),
+            vec![(r"\\.\DISPLAY1".to_string(), true)]
+        );
+
+        assert!(!vis.toggle());
+        assert_eq!(
+            vis.surface_visibility_targets(),
+            vec![(r"\\.\DISPLAY1".to_string(), false)]
+        );
+
+        assert!(vis.toggle());
+        assert!(!vis.toggle());
+        assert!(vis.toggle());
+        assert_eq!(vis.surfaces.len(), 1);
+        assert!(vis.visible);
+    }
+
+    #[test]
+    fn test_visibility_all_monitor_sync_and_topology_while_hidden() {
+        let mut vis = TaskbarVisibilityState::new(r"\\.\DISPLAY1");
+        let plan_init = vis.reconcile(&[r"\\.\DISPLAY1".to_string(), r"\\.\DISPLAY2".to_string()]);
+        assert_eq!(plan_init.to_add, vec![(r"\\.\DISPLAY2".to_string(), true)]);
+
+        // Hide all surfaces
+        assert!(!vis.toggle());
+        assert_eq!(
+            vis.surface_visibility_targets(),
+            vec![
+                (r"\\.\DISPLAY1".to_string(), false),
+                (r"\\.\DISPLAY2".to_string(), false),
+            ]
+        );
+
+        // Attach DISPLAY3 while hidden: must be added with visible=false, never unexpectedly shown
+        let plan_add_hidden = vis.reconcile(&[
+            r"\\.\DISPLAY1".to_string(),
+            r"\\.\DISPLAY2".to_string(),
+            r"\\.\DISPLAY3".to_string(),
+        ]);
+        assert_eq!(
+            plan_add_hidden.to_add,
+            vec![(r"\\.\DISPLAY3".to_string(), false)]
+        );
+
+        // Remove DISPLAY2 while hidden
+        let plan_rm = vis.reconcile(&[r"\\.\DISPLAY1".to_string(), r"\\.\DISPLAY3".to_string()]);
+        assert_eq!(plan_rm.to_remove, vec![r"\\.\DISPLAY2".to_string()]);
+
+        // Restore all surviving surfaces
+        assert!(vis.toggle());
+        assert_eq!(
+            vis.surface_visibility_targets(),
+            vec![
+                (r"\\.\DISPLAY1".to_string(), true),
+                (r"\\.\DISPLAY3".to_string(), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_visibility_missing_or_destroyed_surface_handling() {
+        let mut vis = TaskbarVisibilityState::new(r"\\.\DISPLAY1");
+        let _ = vis.reconcile(&[r"\\.\DISPLAY1".to_string(), r"\\.\DISPLAY2".to_string()]);
+        vis.mark_destroyed(r"\\.\DISPLAY2");
+        vis.mark_destroyed(r"\\.\NONEXISTENT");
+        assert_eq!(vis.surfaces, vec![r"\\.\DISPLAY1".to_string()]);
     }
 }
